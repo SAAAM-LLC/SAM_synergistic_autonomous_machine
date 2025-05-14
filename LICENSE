@@ -1,21 +1,35 @@
-MIT License
+Copyright (c) 2024-2025, SAAAM LLC
+All rights reserved.
 
-Copyright (c) 2024 SAAAM LLC
+Permission is hereby granted, free of charge, to any person or organization obtaining a copy of this software (the "Software"), to use, study, and modify the Software for personal, academic, and research purposes, including internal business purposes, subject to the following conditions:
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+1. **Name Retention**:
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+   * Any use, modification, or derivative work of the Software must retain the name "SAM" (Synergistic Autonomous Machine) in any branding, model naming, or references.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+2. **Attribution Requirement**:
+
+   * Prominent attribution must be given to "SAAAM LLC" and the original creator "Michael'SAM' Wofford" in any public usage, derivative work, publication, or distribution involving the Software.
+   * The README or equivalent documentation for any derivative or distribution must include the following line:
+
+     > "Built upon SAM (Synergistic Autonomous Machine), developed by SAAAM LLC."
+
+3. **Usage Restrictions**:
+
+   * The Software may not be used to misrepresent the origin of the work. No user or organization may claim authorship or original creation of SAM.
+   * Redistribution or deployment in commercial services (whether SaaS, APIs, or embedded systems) must include explicit attribution and comply with the name retention clause.
+
+4. **Commercial Licensing**:
+
+   * Commercial use (outside research, internal experimentation, or non-profit open development) requires a separate license agreement with SAAAM LLC.
+   * Contact \[[contact@saaam.ai](mailto:contact@saaam.org)] for commercial licensing terms.
+
+5. **No Warranty**:
+
+   * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+
+6. **Preservation of Terms**:
+
+   * This license and its terms must be included with all copies or substantial portions of the Software.
+
+By using, modifying, or distributing this Software, you agree to the above terms.
