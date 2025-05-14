@@ -1,0 +1,5 @@
+torch>=1.13.0
+numpy>=1.19.0
+requests>=2.25.0
+aiohttp>=3.7.4
+websockets>=10.0
