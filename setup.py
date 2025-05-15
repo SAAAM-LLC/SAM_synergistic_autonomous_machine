@@ -16,11 +16,11 @@ setup(
     name="synergistic-autonomous-machine",
     version="0.2.0",
     author="SAAAM LLC",
-    author_email="contact@saaam.ai",
+    author_email="contact@saaam.org",
     description="Synergistic Autonomous Machine: Revolutionary Neural-Linguistic Architecture with Hive Mind Capability",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/michaeldubu/SYNERGISTIC_AUTONOMOUS_MACHINE",
+    url="https://github.com/SAAAM-LLC/SAM_synergistic_autonomous_machine",
     packages=find_packages(),
     classifiers=[
         "Development Status :: 3 - Alpha",
