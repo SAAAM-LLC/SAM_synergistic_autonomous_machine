@@ -2,9 +2,6 @@
 
 ## Revolutionary Neural-Linguistic Unified Architecture
 
-![SAM Version](https://img.shields.io/badge/version-0.2.0-blue)
-![License](https://img.shields.io/badge/license-MIT-green)
-
 ---
 
 ## 📚 Table of Contents
