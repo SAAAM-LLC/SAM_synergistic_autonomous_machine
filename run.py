@@ -1,11 +1,13 @@
-# run.py - Entry point for SAM with enhanced error handling
+# run.py - Entry point for SAM with corrected imports
 
 import os
 import sys
 import argparse
 import logging
 import traceback
-from sam import SAM, create_sam_model, SAMTrainer, run_sam
+
+# FIXED IMPORTS - Import directly from sam.py
+from sam.sam import SAM, SAMConfig, create_sam_model, SAMTrainer, run_sam
 
 # Configure logging
 logging.basicConfig(
@@ -142,9 +144,9 @@ def run_training_mode(args):
                 "num_epochs": args.epochs,
                 "multimodal_train": args.multimodal,
                 "gradient_clip_val": 1.0,
-                "save_every_n_steps": 1000,
-                "eval_every_n_steps": 1000,
-                "log_every_n_steps": 100
+                "save_every_n_steps": 100,  # Save more frequently for identity training
+                "eval_every_n_steps": 200,
+                "log_every_n_steps": 10    # Log more frequently for small datasets
             }
             
             # Add learning rate if specified
@@ -260,7 +262,7 @@ def validate_environment():
             logger.info(f"CUDA memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
         
         # Check if SAM module is importable
-        from sam import SAM, SAMConfig
+        from sam.sam import SAM, SAMConfig
         logger.info("SAM module imported successfully")
         
         return True
