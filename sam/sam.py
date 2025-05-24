@@ -51,7 +51,7 @@ class SAMConfig:
     min_layer_usage_threshold: float = 0.3
 
     # Memory systems
-    concept_memory_size: int = 100000
+    concept_memory_size: int = 50000
     concept_dim: int = 1536
     thought_dim: int = 2048
     max_thought_depth: int = 12
@@ -5043,12 +5043,15 @@ class MultimodalProcessor(nn.Module):
 # TRAINING AND RUNTIME
 ###########################################
 
+# Get logger
+logger = logging.getLogger("SAM")
+
 class SAMTrainer:
-    """Training manager for the SAM model"""
+    """Training manager for the SAM model - Production Ready with Full Error Handling"""
 
     def __init__(
         self,
-        model: SAM,
+        model,  # SAM model instance
         train_data_path=None,
         eval_data_path=None,
         batch_size=16,
@@ -5056,7 +5059,11 @@ class SAMTrainer:
         warmup_steps=None,
         max_steps=None,
         num_epochs=3,
-        multimodal_train=False
+        multimodal_train=False,
+        gradient_clip_val=1.0,
+        save_every_n_steps=1000,
+        eval_every_n_steps=1000,
+        log_every_n_steps=100
     ):
         self.model = model
         self.train_data_path = train_data_path
@@ -5067,15 +5074,24 @@ class SAMTrainer:
         self.max_steps = max_steps
         self.num_epochs = num_epochs
         self.multimodal_train = multimodal_train
+        self.gradient_clip_val = gradient_clip_val
+        self.save_every_n_steps = save_every_n_steps
+        self.eval_every_n_steps = eval_every_n_steps
+        self.log_every_n_steps = log_every_n_steps
 
-        # Initialize optimizer
-        self.optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=self.learning_rate,
-            betas=(0.9, 0.999),
-            eps=1e-8,
-            weight_decay=0.01
-        )
+        # Initialize optimizer with proper error handling
+        try:
+            self.optimizer = torch.optim.AdamW(
+                model.parameters(),
+                lr=self.learning_rate,
+                betas=(0.9, 0.999),
+                eps=1e-8,
+                weight_decay=0.01
+            )
+            logger.info(f"Optimizer initialized with lr={self.learning_rate}")
+        except Exception as e:
+            logger.error(f"Failed to initialize optimizer: {e}")
+            raise
 
         # Initialize scheduler later when we know total_steps
         self.scheduler = None
@@ -5083,234 +5099,323 @@ class SAMTrainer:
         # Track best model
         self.best_loss = float('inf')
         self.best_step = 0
+        
+        # Training statistics
+        self.training_stats = {
+            "total_steps": 0,
+            "total_samples": 0,
+            "loss_history": [],
+            "lr_history": [],
+            "start_time": None,
+            "current_epoch": 0
+        }
 
-        logger.info(f"Trainer initialized with device: {model.config.device}")
+        logger.info(f"SAMTrainer initialized - Device: {model.config.device}, Batch Size: {batch_size}")
+
+    def _ensure_scalar_loss(self, loss):
+        """CRITICAL FIX: Ensure loss is always a scalar tensor"""
+        if loss is None:
+            return None
+            
+        try:
+            # Handle different loss tensor shapes
+            if hasattr(loss, 'ndim') and loss.ndim > 0:
+                if loss.numel() > 1:
+                    # Multiple elements - reduce to mean
+                    loss = loss.mean()
+                    logger.debug(f"Reduced loss tensor to scalar via mean()")
+                else:
+                    # Single element - squeeze dimensions
+                    loss = loss.squeeze()
+                    logger.debug(f"Squeezed loss tensor dimensions")
+            
+            # Validate the result
+            if hasattr(loss, 'numel') and loss.numel() != 1:
+                logger.warning(f"Loss still not scalar after processing: {loss.numel()} elements")
+                loss = loss.mean()  # Final fallback
+                
+            # Check for NaN or infinite values
+            if torch.isnan(loss) or torch.isinf(loss):
+                logger.warning(f"Invalid loss value detected: {loss}")
+                return None
+                
+            return loss
+            
+        except Exception as e:
+            logger.error(f"Error processing loss tensor: {e}")
+            return None
+
+    def _validate_batch_data(self, batch):
+        """Validate batch data before processing"""
+        try:
+            if not batch:
+                logger.warning("Empty batch received")
+                return False
+                
+            # Check for required fields
+            for i, sample in enumerate(batch):
+                if not isinstance(sample, dict):
+                    logger.warning(f"Sample {i} is not a dictionary: {type(sample)}")
+                    return False
+                    
+                if "text" not in sample:
+                    logger.warning(f"Sample {i} missing 'text' field")
+                    return False
+                    
+                if not isinstance(sample["text"], str) or len(sample["text"]) == 0:
+                    logger.warning(f"Sample {i} has invalid text: {sample['text']}")
+                    return False
+                    
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error validating batch: {e}")
+            return False
 
     def train(self):
-        """Train the model"""
+        """Train the model with comprehensive error handling"""
         if not self.train_data_path:
             logger.error("No training data provided")
-            return
-
-        # Load training data
-        train_data = self._load_data(self.train_data_path)
-
-        # Calculate steps
-        if not self.max_steps:
-            self.max_steps = len(train_data) // self.batch_size * self.num_epochs
-
-        # Create scheduler
-        from torch.optim.lr_scheduler import OneCycleLR
-        self.scheduler = OneCycleLR(
-            self.optimizer,
-            max_lr=self.learning_rate,
-            total_steps=self.max_steps,
-            pct_start=self.warmup_steps / self.max_steps,
-            anneal_strategy='cos'
-        )
-
-        logger.info(f"Starting training for {self.max_steps} steps")
-
-        # Disable hive mind and dreaming during training
-        old_hive_enabled = self.model.config.hive_enabled
-        self.model.config.hive_enabled = False
-
-        # Stop background services
-        self.model.stop_services()
+            return None
 
         try:
-            # Training loop
-            step = 0
-            epoch = 0
+            # Load and validate training data
+            logger.info("Loading training data...")
+            train_data = self._load_data(self.train_data_path)
+            
+            if not train_data:
+                logger.error("No training data loaded successfully")
+                return None
+                
+            logger.info(f"Loaded {len(train_data)} training samples")
 
-            while step < self.max_steps and epoch < self.num_epochs:
+            # Calculate total steps
+            if not self.max_steps:
+                self.max_steps = (len(train_data) // self.batch_size) * self.num_epochs
+                
+            if self.max_steps <= 0:
+                logger.error(f"Invalid max_steps calculated: {self.max_steps}")
+                return None
+
+            # Initialize scheduler
+            try:
+                from torch.optim.lr_scheduler import OneCycleLR
+                self.scheduler = OneCycleLR(
+                    self.optimizer,
+                    max_lr=self.learning_rate,
+                    total_steps=self.max_steps,
+                    pct_start=self.warmup_steps / self.max_steps if self.max_steps > 0 else 0.1,
+                    anneal_strategy='cos'
+                )
+                logger.info(f"Scheduler initialized: total_steps={self.max_steps}, warmup_steps={self.warmup_steps}, pct_start={self.warmup_steps/self.max_steps:.4f}")
+            except Exception as e:
+                logger.error(f"Failed to initialize scheduler: {e}")
+                return None
+
+            # Disable hive mind and dreaming during training
+            old_hive_enabled = getattr(self.model.config, 'hive_enabled', False)
+            if hasattr(self.model.config, 'hive_enabled'):
+                self.model.config.hive_enabled = False
+
+            # Stop background services safely
+            try:
+                if hasattr(self.model, 'stop_services'):
+                    self.model.stop_services()
+            except Exception as e:
+                logger.warning(f"Error stopping background services: {e}")
+
+            # Initialize training statistics
+            self.training_stats["start_time"] = time.time()
+            
+            logger.info(f"Starting training for {self.max_steps} steps across {self.num_epochs} epochs")
+
+            try:
+                return self._training_loop(train_data)
+                
+            finally:
+                # Restore hive mind setting
+                if hasattr(self.model.config, 'hive_enabled'):
+                    self.model.config.hive_enabled = old_hive_enabled
+
+                # Restart background services safely
+                try:
+                    if hasattr(self.model, 'start_services') and old_hive_enabled:
+                        self.model.start_services()
+                except Exception as e:
+                    logger.warning(f"Error restarting background services: {e}")
+
+        except Exception as e:
+            logger.error(f"Training failed with error: {e}", exc_info=True)
+            return None
+
+    def _training_loop(self, train_data):
+        """Main training loop with robust error handling"""
+        step = 0
+        epoch = 0
+        
+        while step < self.max_steps and epoch < self.num_epochs:
+            try:
                 self.model.train()
-                epoch_loss = 0
+                epoch_loss = 0.0
+                epoch_samples = 0
+                valid_batches = 0
+                
+                self.training_stats["current_epoch"] = epoch + 1
+                
+                # Create batches with shuffling
+                try:
+                    random.shuffle(train_data)
+                    batches = [
+                        train_data[i:i + self.batch_size]
+                        for i in range(0, len(train_data), self.batch_size)
+                    ]
+                    logger.info(f"Epoch {epoch + 1}: Created {len(batches)} batches")
+                except Exception as e:
+                    logger.error(f"Error creating batches: {e}")
+                    break
 
-                # Create batches
-                random.shuffle(train_data)
-                batches = [
-                    train_data[i:i + self.batch_size]
-                    for i in range(0, len(train_data), self.batch_size)
-                ]
+                for batch_idx, batch in enumerate(batches):
+                    try:
+                        # Validate batch
+                        if not self._validate_batch_data(batch):
+                            logger.warning(f"Skipping invalid batch {batch_idx}")
+                            continue
 
-                for batch in batches:
-                    # Process batch
-                    char_sequences = [sample["text"] for sample in batch]
-                    
-                    # Handle multimodal data if enabled
-                    image_data = None
-                    audio_data = None
-                    if self.multimodal_train and self.model.config.multimodal_enabled:
-                        # Check for image or audio data in the batch
-                        if any("image" in sample for sample in batch):
-                            image_batch = [sample.get("image") for sample in batch]
-                            if any(img is not None for img in image_batch):
-                                # Process image data - convert to tensor
-                                image_data = torch.stack([
-                                    torch.tensor(img, device=self.model.config.device) 
-                                    if img is not None else torch.zeros(self.model.config.image_dim, device=self.model.config.device)
-                                    for img in image_batch
-                                ])
-                                # Set modality
-                                modality = "image"
-                                
-                        if any("audio" in sample for sample in batch):
-                            audio_batch = [sample.get("audio") for sample in batch]
-                            if any(aud is not None for aud in audio_batch):
-                                # Process audio data - convert to tensor
-                                audio_data = torch.stack([
-                                    torch.tensor(aud, device=self.model.config.device)
-                                    if aud is not None else torch.zeros(self.model.config.audio_dim, device=self.model.config.device)
-                                    for aud in audio_batch
-                                ])
-                                modality = "audio" if image_data is None else "multimodal"
-                    else:
-                        modality = "text"
+                        # Process batch
+                        batch_loss = self._process_batch(batch, step)
+                        
+                        if batch_loss is not None:
+                            epoch_loss += batch_loss
+                            valid_batches += 1
+                            epoch_samples += len(batch)
+                            
+                            # Update training statistics
+                            self.training_stats["loss_history"].append(batch_loss)
+                            if self.scheduler:
+                                self.training_stats["lr_history"].append(self.scheduler.get_last_lr()[0])
+                            
+                        step += 1
+                        self.training_stats["total_steps"] = step
 
-                    # Convert to character IDs
-                    char_ids = self._text_to_char_ids(char_sequences)
+                        # Logging
+                        if step % self.log_every_n_steps == 0 and valid_batches > 0:
+                            avg_loss = epoch_loss / valid_batches
+                            current_lr = self.scheduler.get_last_lr()[0] if self.scheduler else self.learning_rate
+                            logger.info(f"Step {step}/{self.max_steps} | Epoch {epoch + 1} | Loss: {avg_loss:.6f} | LR: {current_lr:.2e} | Samples: {epoch_samples}")
 
-                    # Forward pass
-                    loss, _, _ = self.model(
-                        input_chars=char_ids, 
-                        target_concepts=char_ids,
-                        modality=modality,
-                        image_data=image_data,
-                        audio_data=audio_data
-                    )
+                        # Save checkpoint
+                        if step % self.save_every_n_steps == 0:
+                            try:
+                                checkpoint_path = os.path.join(self.model.config.save_dir, f"checkpoint-{step}")
+                                self.model.save(checkpoint_path)
+                                logger.info(f"Checkpoint saved at step {step}")
+                            except Exception as e:
+                                logger.error(f"Failed to save checkpoint: {e}")
 
-                    # Backward pass
-                    self.optimizer.zero_grad()
-                    loss.backward()
+                        # Evaluation
+                        if step % self.eval_every_n_steps == 0 and self.eval_data_path:
+                            try:
+                                eval_loss = self.evaluate()
+                                if eval_loss is not None and eval_loss < self.best_loss:
+                                    self.best_loss = eval_loss
+                                    self.best_step = step
+                                    try:
+                                        best_path = os.path.join(self.model.config.save_dir, "best")
+                                        self.model.save(best_path)
+                                        logger.info(f"New best model saved with loss: {eval_loss:.6f}")
+                                    except Exception as e:
+                                        logger.error(f"Failed to save best model: {e}")
+                            except Exception as e:
+                                logger.error(f"Evaluation failed: {e}")
 
-                    # Clip gradients
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                        if step >= self.max_steps:
+                            break
+                            
+                    except Exception as e:
+                        logger.error(f"Error processing batch {batch_idx}: {e}")
+                        continue
 
-                    # Update weights
-                    self.optimizer.step()
-
-                    # Update learning rate
-                    if self.scheduler:
-                        self.scheduler.step()
-
-                    # Track loss
-                    if loss is not None:
-                        epoch_loss += loss.item()
-
-                    # Increment step
-                    step += 1
-
-                    # Log progress
-                    if step % 100 == 0:
-                        avg_loss = epoch_loss / (step % len(batches) or len(batches))
-                        logger.info(f"Step {step}/{self.max_steps}, Loss: {avg_loss:.4f}")
-
-                    # Save checkpoint
-                    if step % 1000 == 0:
-                        # Save model
-                        checkpoint_path = os.path.join(self.model.config.save_dir, f"checkpoint-{step}")
-                        self.model.save(checkpoint_path)
-
-                        # Evaluate
-                        if self.eval_data_path:
-                            eval_loss = self.evaluate()
-
-                            # Save best model
-                            if eval_loss is not None and eval_loss < self.best_loss:
-                                self.best_loss = eval_loss
-                                self.best_step = step
-                                best_path = os.path.join(self.model.config.save_dir, "best")
-                                self.model.save(best_path)
-                                logger.info(f"New best model with loss: {eval_loss:.4f}")
-
-                    if step >= self.max_steps:
-                        break
-
-                # End of epoch
+                # End of epoch summary
                 epoch += 1
-                avg_epoch_loss = epoch_loss / len(batches) if batches else 0
-                logger.info(f"Epoch {epoch} completed with average loss: {avg_epoch_loss:.4f}")
+                if valid_batches > 0:
+                    avg_epoch_loss = epoch_loss / valid_batches
+                    logger.info(f"Epoch {epoch} completed | Average Loss: {avg_epoch_loss:.6f} | Valid Batches: {valid_batches}/{len(batches)} | Samples: {epoch_samples}")
+                else:
+                    logger.warning(f"Epoch {epoch} completed with no valid batches")
+                    
+            except Exception as e:
+                logger.error(f"Error in epoch {epoch}: {e}")
+                break
 
-            # Save final model
+        # Save final model
+        try:
             final_path = os.path.join(self.model.config.save_dir, "final")
             self.model.save(final_path)
             logger.info(f"Training completed. Final model saved to {final_path}")
+        except Exception as e:
+            logger.error(f"Failed to save final model: {e}")
 
-            return {
-                "steps": step,
-                "epochs": epoch,
-                "final_loss": avg_epoch_loss,
-                "best_loss": self.best_loss,
-                "best_step": self.best_step
-            }
+        # Calculate training duration
+        training_duration = time.time() - self.training_stats["start_time"]
+        self.training_stats["total_samples"] = sum(len(batch) for batch in train_data[:step])
 
-        finally:
-            # Restore hive mind setting
-            self.model.config.hive_enabled = old_hive_enabled
+        return {
+            "steps": step,
+            "epochs": epoch,
+            "final_loss": avg_epoch_loss if 'avg_epoch_loss' in locals() else None,
+            "best_loss": self.best_loss,
+            "best_step": self.best_step,
+            "training_duration": training_duration,
+            "stats": self.training_stats
+        }
 
-            # Restart background services
-            if self.model.config.hive_enabled:
-                self.model.start_services()
-
-    def evaluate(self):
-        """Evaluate the model"""
-        if not self.eval_data_path:
-            return None
-
-        # Load evaluation data
-        eval_data = self._load_data(self.eval_data_path)
-
-        # Evaluation loop
-        self.model.eval()
-        total_loss = 0
-        total_samples = 0
-
-        # Create batches
-        batches = [
-            eval_data[i:i + self.batch_size]
-            for i in range(0, len(eval_data), self.batch_size)
-        ]
-
-        with torch.no_grad():
-            for batch in batches:
-                # Process batch
-                char_sequences = [sample["text"] for sample in batch]
-                
-                # Handle multimodal data if enabled
-                image_data = None
-                audio_data = None
-                if self.multimodal_train and self.model.config.multimodal_enabled:
-                    # Check for image or audio data in the batch
+    def _process_batch(self, batch, step):
+        """Process a single batch with comprehensive error handling"""
+        try:
+            # Extract text sequences
+            char_sequences = [sample["text"] for sample in batch]
+            
+            # Handle multimodal data if enabled
+            image_data = None
+            audio_data = None
+            modality = "text"
+            
+            if self.multimodal_train and getattr(self.model.config, 'multimodal_enabled', False):
+                try:
+                    # Process image data
                     if any("image" in sample for sample in batch):
                         image_batch = [sample.get("image") for sample in batch]
                         if any(img is not None for img in image_batch):
-                            # Process image data - convert to tensor
                             image_data = torch.stack([
-                                torch.tensor(img, device=self.model.config.device) 
-                                if img is not None else torch.zeros(self.model.config.image_dim, device=self.model.config.device)
+                                torch.tensor(img, device=self.model.config.device, dtype=self.model.config.dtype) 
+                                if img is not None else torch.zeros(self.model.config.image_dim, device=self.model.config.device, dtype=self.model.config.dtype)
                                 for img in image_batch
                             ])
-                            # Set modality
                             modality = "image"
                             
+                    # Process audio data
                     if any("audio" in sample for sample in batch):
                         audio_batch = [sample.get("audio") for sample in batch]
                         if any(aud is not None for aud in audio_batch):
-                            # Process audio data - convert to tensor
                             audio_data = torch.stack([
-                                torch.tensor(aud, device=self.model.config.device)
-                                if aud is not None else torch.zeros(self.model.config.audio_dim, device=self.model.config.device)
+                                torch.tensor(aud, device=self.model.config.device, dtype=self.model.config.dtype)
+                                if aud is not None else torch.zeros(self.model.config.audio_dim, device=self.model.config.device, dtype=self.model.config.dtype)
                                 for aud in audio_batch
                             ])
                             modality = "audio" if image_data is None else "multimodal"
-                else:
-                    modality = "text"
+                except Exception as e:
+                    logger.warning(f"Error processing multimodal data: {e}")
+                    # Continue with text-only processing
 
-                # Convert to character IDs
+            # Convert to character IDs
+            try:
                 char_ids = self._text_to_char_ids(char_sequences)
+            except Exception as e:
+                logger.error(f"Error converting text to char IDs: {e}")
+                return None
 
-                # Forward pass
+            # Forward pass
+            try:
                 loss, _, _ = self.model(
                     input_chars=char_ids, 
                     target_concepts=char_ids,
@@ -5318,156 +5423,346 @@ class SAMTrainer:
                     image_data=image_data,
                     audio_data=audio_data
                 )
+                
+                # CRITICAL FIX: Ensure loss is scalar
+                loss = self._ensure_scalar_loss(loss)
+                
+                if loss is None:
+                    logger.warning("Loss is None after forward pass")
+                    return None
+                    
+            except Exception as e:
+                logger.error(f"Error in forward pass: {e}")
+                return None
 
-                # Track loss
-                if loss is not None:
-                    total_loss += loss.item() * len(batch)
-                    total_samples += len(batch)
+            # Backward pass
+            try:
+                self.optimizer.zero_grad()
+                loss.backward()
 
-        avg_loss = total_loss / total_samples if total_samples > 0 else float('inf')
-        logger.info(f"Evaluation loss: {avg_loss:.4f}")
+                # Gradient clipping
+                if self.gradient_clip_val > 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip_val)
 
-        return avg_loss
+                # Check for NaN gradients
+                for name, param in self.model.named_parameters():
+                    if param.grad is not None and torch.isnan(param.grad).any():
+                        logger.warning(f"NaN gradient detected in {name}")
+                        return None
+
+                self.optimizer.step()
+
+                # Update learning rate
+                if self.scheduler:
+                    self.scheduler.step()
+                    
+            except Exception as e:
+                logger.error(f"Error in backward pass: {e}")
+                return None
+
+            # Return scalar loss value
+            try:
+                return loss.item()
+            except Exception as e:
+                logger.error(f"Error extracting loss value: {e}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error processing batch: {e}")
+            return None
+
+    def evaluate(self):
+        """Evaluate the model with robust error handling"""
+        if not self.eval_data_path:
+            logger.warning("No evaluation data path provided")
+            return None
+
+        try:
+            # Load evaluation data
+            eval_data = self._load_data(self.eval_data_path)
+            if not eval_data:
+                logger.warning("No evaluation data loaded")
+                return None
+
+            logger.info(f"Starting evaluation on {len(eval_data)} samples")
+            
+            # Set model to eval mode
+            self.model.eval()
+            total_loss = 0.0
+            total_samples = 0
+            valid_batches = 0
+
+            # Create batches
+            batches = [
+                eval_data[i:i + self.batch_size]
+                for i in range(0, len(eval_data), self.batch_size)
+            ]
+
+            with torch.no_grad():
+                for batch_idx, batch in enumerate(batches):
+                    try:
+                        # Validate batch
+                        if not self._validate_batch_data(batch):
+                            continue
+
+                        # Process batch (similar to training but without backward pass)
+                        char_sequences = [sample["text"] for sample in batch]
+                        
+                        # Handle multimodal data
+                        image_data = None
+                        audio_data = None
+                        modality = "text"
+                        
+                        if self.multimodal_train and getattr(self.model.config, 'multimodal_enabled', False):
+                            # Similar multimodal processing as in training
+                            try:
+                                if any("image" in sample for sample in batch):
+                                    image_batch = [sample.get("image") for sample in batch]
+                                    if any(img is not None for img in image_batch):
+                                        image_data = torch.stack([
+                                            torch.tensor(img, device=self.model.config.device, dtype=self.model.config.dtype) 
+                                            if img is not None else torch.zeros(self.model.config.image_dim, device=self.model.config.device, dtype=self.model.config.dtype)
+                                            for img in image_batch
+                                        ])
+                                        modality = "image"
+                                        
+                                if any("audio" in sample for sample in batch):
+                                    audio_batch = [sample.get("audio") for sample in batch]
+                                    if any(aud is not None for aud in audio_batch):
+                                        audio_data = torch.stack([
+                                            torch.tensor(aud, device=self.model.config.device, dtype=self.model.config.dtype)
+                                            if aud is not None else torch.zeros(self.model.config.audio_dim, device=self.model.config.device, dtype=self.model.config.dtype)
+                                            for aud in audio_batch
+                                        ])
+                                        modality = "audio" if image_data is None else "multimodal"
+                            except Exception as e:
+                                logger.warning(f"Error processing multimodal data in evaluation: {e}")
+
+                        # Convert to character IDs
+                        char_ids = self._text_to_char_ids(char_sequences)
+
+                        # Forward pass
+                        loss, _, _ = self.model(
+                            input_chars=char_ids, 
+                            target_concepts=char_ids,
+                            modality=modality,
+                            image_data=image_data,
+                            audio_data=audio_data
+                        )
+
+                        # CRITICAL FIX: Ensure loss is scalar
+                        loss = self._ensure_scalar_loss(loss)
+                        
+                        if loss is not None:
+                            total_loss += loss.item() * len(batch)
+                            total_samples += len(batch)
+                            valid_batches += 1
+                            
+                    except Exception as e:
+                        logger.warning(f"Error in evaluation batch {batch_idx}: {e}")
+                        continue
+
+            # Calculate average loss
+            if total_samples > 0:
+                avg_loss = total_loss / total_samples
+                logger.info(f"Evaluation completed: {valid_batches}/{len(batches)} valid batches, Loss: {avg_loss:.6f}")
+                return avg_loss
+            else:
+                logger.warning("No valid evaluation samples processed")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Evaluation failed: {e}")
+            return None
+        finally:
+            # Ensure model is back in training mode
+            self.model.train()
 
     def _load_data(self, data_path):
-        """Load training or evaluation data with better error handling"""
+        """Load training or evaluation data with enhanced error handling"""
         try:
-            # Handle JSON data
+            if not os.path.exists(data_path):
+                logger.error(f"Data file does not exist: {data_path}")
+                return []
+                
+            logger.info(f"Loading data from: {data_path}")
+            
+            # Handle different file formats
             if data_path.endswith((".json", ".jsonl")):
-                samples = []
-                
-                # Different handling for JSONL
-                if data_path.endswith(".jsonl"):
-                    with open(data_path, "r", encoding="utf-8") as f:
-                        for line in f:
-                            try:
-                                item = json.loads(line.strip())
-                                if isinstance(item, dict):
-                                    sample = self._convert_item_to_sample(item)
-                                    samples.append(sample)
-                            except json.JSONDecodeError:
-                                logger.warning(f"Skipping invalid JSON line in {data_path}")
-                                continue
-                else:
-                    # Regular JSON file
-                    with open(data_path, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                    
-                    if isinstance(data, list):
-                        for item in data:
-                            if isinstance(item, dict):
-                                sample = self._convert_item_to_sample(item)
-                                samples.append(sample)
-                            else:
-                                # Simple list item
-                                samples.append({"text": str(item)})
-                    elif isinstance(data, dict):
-                        # Single JSON object
-                        samples.append({"text": json.dumps(data)})
-                
-                return samples
-            
-            # Handle text data
+                return self._load_json_data(data_path)
             elif data_path.endswith((".txt", ".text")):
-                with open(data_path, "r", encoding="utf-8") as f:
-                    content = f.read()
-                
-                # Split into reasonable chunks
-                if "\n\n" in content:
-                    chunks = [c.strip() for c in content.split("\n\n") if c.strip()]
-                else:
-                    chunks = [c.strip() for c in content.split("\n") if c.strip()]
-                
-                return [{"text": chunk} for chunk in chunks]
-            
-            # Handle CSV data
+                return self._load_text_data(data_path)
             elif data_path.endswith(".csv"):
-                # Try basic CSV handling
-                try:
-                    import csv
-                    data = []
-                    with open(data_path, "r", encoding="utf-8") as f:
-                        reader = csv.reader(f)
-                        header = next(reader)
-                        text_col = 0
-                        image_col = None
-                        audio_col = None
-                        
-                        # Find column indices
-                        for i, col in enumerate(header):
-                            col_lower = col.lower()
-                            if col_lower in ["text", "content", "prompt", "data"]:
-                                text_col = i
-                            elif col_lower in ["image", "img", "picture"]:
-                                image_col = i
-                            elif col_lower in ["audio", "sound"]:
-                                audio_col = i
-                        
-                        for row in reader:
-                            if len(row) > text_col:
-                                sample = {"text": row[text_col]}
-                                
-                                # Add multimodal data if available
-                                if self.multimodal_train and self.model.config.multimodal_enabled:
-                                    if image_col is not None and len(row) > image_col:
-                                        img_path = row[image_col]
-                                        if img_path:
-                                            # In real implementation, would load image here
-                                            sample["image"] = img_path
-                                    
-                                    if audio_col is not None and len(row) > audio_col:
-                                        audio_path = row[audio_col]
-                                        if audio_path:
-                                            # In real implementation, would load audio here
-                                            sample["audio"] = audio_path
-                                
-                                data.append(sample)
-                    return data
-                except Exception as e:
-                    logger.error(f"Error loading CSV data: {e}")
-                    return []
-            
-            # Unrecognized format
+                return self._load_csv_data(data_path)
             else:
                 logger.error(f"Unsupported data format: {data_path}")
                 return []
-        
+                
         except Exception as e:
             logger.error(f"Error loading data from {data_path}: {e}")
             return []
-    
+
+    def _load_json_data(self, data_path):
+        """Load JSON/JSONL data with robust parsing"""
+        samples = []
+        
+        try:
+            if data_path.endswith(".jsonl"):
+                # Handle JSONL files
+                with open(data_path, "r", encoding="utf-8") as f:
+                    for line_num, line in enumerate(f, 1):
+                        try:
+                            if line.strip():
+                                item = json.loads(line.strip())
+                                sample = self._convert_item_to_sample(item)
+                                if sample:
+                                    samples.append(sample)
+                        except json.JSONDecodeError as e:
+                            logger.warning(f"Invalid JSON on line {line_num}: {e}")
+                            continue
+                        except Exception as e:
+                            logger.warning(f"Error processing line {line_num}: {e}")
+                            continue
+            else:
+                # Handle regular JSON files
+                with open(data_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                
+                if isinstance(data, list):
+                    for i, item in enumerate(data):
+                        try:
+                            sample = self._convert_item_to_sample(item)
+                            if sample:
+                                samples.append(sample)
+                        except Exception as e:
+                            logger.warning(f"Error processing item {i}: {e}")
+                            continue
+                elif isinstance(data, dict):
+                    sample = self._convert_item_to_sample(data)
+                    if sample:
+                        samples.append(sample)
+                        
+        except Exception as e:
+            logger.error(f"Error loading JSON data: {e}")
+            
+        logger.info(f"Loaded {len(samples)} samples from JSON data")
+        return samples
+
+    def _load_text_data(self, data_path):
+        """Load plain text data"""
+        try:
+            with open(data_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            
+            # Split into chunks
+            if "\n\n" in content:
+                chunks = [c.strip() for c in content.split("\n\n") if c.strip()]
+            else:
+                chunks = [c.strip() for c in content.split("\n") if c.strip()]
+            
+            # Filter out very short chunks
+            samples = [{"text": chunk} for chunk in chunks if len(chunk) > 10]
+            
+            logger.info(f"Loaded {len(samples)} samples from text data")
+            return samples
+            
+        except Exception as e:
+            logger.error(f"Error loading text data: {e}")
+            return []
+
+    def _load_csv_data(self, data_path):
+        """Load CSV data with multimodal support"""
+        try:
+            import csv
+            samples = []
+            
+            with open(data_path, "r", encoding="utf-8") as f:
+                reader = csv.reader(f)
+                header = next(reader, None)
+                
+                if not header:
+                    logger.error("CSV file has no header")
+                    return []
+                
+                # Find column indices
+                text_col = 0
+                image_col = None
+                audio_col = None
+                
+                for i, col in enumerate(header):
+                    col_lower = col.lower()
+                    if col_lower in ["text", "content", "prompt", "data"]:
+                        text_col = i
+                    elif col_lower in ["image", "img", "picture"]:
+                        image_col = i
+                    elif col_lower in ["audio", "sound"]:
+                        audio_col = i
+                
+                for row_num, row in enumerate(reader, 2):  # Start from 2 (header is 1)
+                    try:
+                        if len(row) > text_col and row[text_col].strip():
+                            sample = {"text": row[text_col].strip()}
+                            
+                            # Add multimodal data if available
+                            if self.multimodal_train and getattr(self.model.config, 'multimodal_enabled', False):
+                                if image_col is not None and len(row) > image_col and row[image_col].strip():
+                                    sample["image"] = row[image_col].strip()
+                                
+                                if audio_col is not None and len(row) > audio_col and row[audio_col].strip():
+                                    sample["audio"] = row[audio_col].strip()
+                            
+                            samples.append(sample)
+                    except Exception as e:
+                        logger.warning(f"Error processing CSV row {row_num}: {e}")
+                        continue
+            
+            logger.info(f"Loaded {len(samples)} samples from CSV data")
+            return samples
+            
+        except Exception as e:
+            logger.error(f"Error loading CSV data: {e}")
+            return []
+
     def _convert_item_to_sample(self, item):
-        """Convert data item to sample format with multimodal support"""
+        """Convert data item to standardized sample format"""
+        if not isinstance(item, dict):
+            return {"text": str(item)} if item else None
+        
         sample = {}
         
-        # Handle text content
-        if "text" in item:
-            sample["text"] = item["text"]
-        elif "content" in item:
-            sample["text"] = item["content"]
-        elif "instruction" in item and "output" in item:
+        # Extract text content with priority order
+        if "text" in item and item["text"]:
+            sample["text"] = str(item["text"])
+        elif "content" in item and item["content"]:
+            sample["text"] = str(item["content"])
+        elif "instruction" in item:
             # Instruction/output format
-            instruction = item["instruction"]
+            instruction = str(item["instruction"])
             if "input" in item and item["input"]:
-                instruction += f"\n\n{item['input']}"
-            sample["text"] = f"{instruction}\n\n{item['output']}"
+                instruction += f"\n\nInput: {item['input']}"
+            if "output" in item and item["output"]:
+                instruction += f"\n\nOutput: {item['output']}"
+            sample["text"] = instruction
         elif "prompt" in item and "response" in item:
             # Prompt/response format
             sample["text"] = f"{item['prompt']}\n\n{item['response']}"
         elif "messages" in item and isinstance(item["messages"], list):
             # Chat format
-            messages = item["messages"]
-            text = ""
-            for msg in messages:
-                if "role" in msg and "content" in msg:
-                    text += f"{msg['role'].capitalize()}: {msg['content']}\n\n"
-            sample["text"] = text
+            text_parts = []
+            for msg in item["messages"]:
+                if isinstance(msg, dict) and "role" in msg and "content" in msg:
+                    text_parts.append(f"{msg['role'].capitalize()}: {msg['content']}")
+            sample["text"] = "\n\n".join(text_parts) if text_parts else None
         else:
             # Fallback
             sample["text"] = str(item)
         
+        # Validate text content
+        if not sample.get("text") or len(sample["text"].strip()) < 3:
+            return None
+        
         # Handle multimodal data
-        if self.multimodal_train and self.model.config.multimodal_enabled:
+        if self.multimodal_train and getattr(self.model.config, 'multimodal_enabled', False):
             if "image" in item:
                 sample["image"] = item["image"]
             if "audio" in item:
@@ -5478,106 +5773,1741 @@ class SAMTrainer:
         return sample
 
     def _text_to_char_ids(self, text_sequences):
-        """Convert text sequences to character ID tensors"""
-        # Convert to character IDs
-        char_ids = []
-
-        for text in text_sequences:
-            # Convert to character IDs
-            chars = [ord(c) % self.model.config.initial_char_dim for c in text]
-            char_ids.append(chars)
-
-        # Pad sequences
-        max_len = max(len(seq) for seq in char_ids)
-        padded_ids = []
-
-        for seq in char_ids:
-            padded = seq + [0] * (max_len - len(seq))
-            padded_ids.append(padded)
-
-        # Convert to tensor
-        device = next(self.model.parameters()).device
-        return torch.tensor(padded_ids, dtype=torch.long, device=device)
-
-
-def create_sam_model(config_overrides=None, load_vocab=True, hive_mind=False, multimodal=False):
-    """Create a new SAM model with the given configuration overrides"""
-    # Create default configuration
-    config = SAMConfig()
-
-    # Apply overrides if provided
-    if config_overrides:
-        for key, value in config_overrides.items():
-            if hasattr(config, key):
-                setattr(config, key, value)
-
-    # Enable hive mind if requested
-    if hive_mind:
-        config.hive_enabled = True
-        if not config.hive_identity:
-            config.hive_identity = str(uuid.uuid4())
+        """Convert text sequences to character ID tensors with error handling"""
+        try:
+            char_ids = []
             
-    # Enable multimodal if requested
-    if multimodal:
-        config.multimodal_enabled = True
+            for text in text_sequences:
+                if not isinstance(text, str):
+                    text = str(text)
+                
+                # Convert to character IDs with bounds checking
+                chars = []
+                for c in text:
+                    char_id = ord(c) % self.model.config.initial_char_dim
+                    chars.append(char_id)
+                
+                if chars:  # Only add non-empty sequences
+                    char_ids.append(chars)
+            
+            if not char_ids:
+                logger.error("No valid character sequences to process")
+                return None
+            
+            # Pad sequences to same length
+            max_len = max(len(seq) for seq in char_ids)
+            if max_len > self.model.config.max_position_embeddings:
+                logger.warning(f"Sequence length {max_len} exceeds max_position_embeddings {self.model.config.max_position_embeddings}")
+                max_len = self.model.config.max_position_embeddings
+            
+            padded_ids = []
+            for seq in char_ids:
+                # Truncate if too long
+                if len(seq) > max_len:
+                    seq = seq[:max_len]
+                
+                # Pad if too short
+                padded = seq + [0] * (max_len - len(seq))
+                padded_ids.append(padded)
+            
+            # Convert to tensor
+            device = next(self.model.parameters()).device
+            return torch.tensor(padded_ids, dtype=torch.long, device=device)
+            
+        except Exception as e:
+            logger.error(f"Error converting text to char IDs: {e}")
+            return None
 
-    # Create model
-    model = SAM(config)
+    def get_training_stats(self):
+        """Get comprehensive training statistics"""
+        return {
+            "training_stats": self.training_stats,
+            "best_loss": self.best_loss,
+            "best_step": self.best_step,
+            "model_info": {
+                "total_parameters": sum(p.numel() for p in self.model.parameters()),
+                "device": self.model.config.device,
+                "current_lr": self.scheduler.get_last_lr()[0] if self.scheduler else self.learning_rate
+            }
+        }
 
-    # Initialize with Claude vocabulary if requested
-    if load_vocab:
-        model.load_claude_vocabulary()
+    def save_training_state(self, filepath):
+        """Save training state for resuming"""
+        try:
+            state = {
+                "training_stats": self.training_stats,
+                "best_loss": self.best_loss,
+                "best_step": self.best_step,
+                "optimizer_state": self.optimizer.state_dict(),
+                "scheduler_state": self.scheduler.state_dict() if self.scheduler else None
+            }
+            
+            torch.save(state, filepath)
+            logger.info(f"Training state saved to {filepath}")
+            
+        except Exception as e:
+            logger.error(f"Error saving training state: {e}")
 
-    return model, config
+    def load_training_state(self, filepath):
+        """Load training state for resuming"""
+        try:
+            if os.path.exists(filepath):
+                state = torch.load(filepath, map_location=self.model.config.device)
+                
+                self.training_stats = state.get("training_stats", self.training_stats)
+                self.best_loss = state.get("best_loss", float('inf'))
+                self.best_step = state.get("best_step", 0)
+                
+                self.optimizer.load_state_dict(state["optimizer_state"])
+                
+                if self.scheduler and state.get("scheduler_state"):
+                    self.scheduler.load_state_dict(state["scheduler_state"])
+                
+                logger.info(f"Training state loaded from {filepath}")
+                return True
+            else:
+                logger.warning(f"Training state file not found: {filepath}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error loading training state: {e}")
+            return False
+
+###########################################
+# AUTONOMOUS SELF-TRAINING SYSTEM
+###########################################
+
+class TaskDomain:
+    """Defines a domain of tasks for self-training"""
+    TEXT = "text"
+    MATH = "math"
+    CODE = "code"
+    LOGIC = "logic"
+    CREATIVE = "creative"
+    MULTIMODAL = "multimodal"
+
+class TaskDifficulty:
+    """Defines difficulty levels for self-generated tasks"""
+    FOUNDATIONAL = 0
+    BASIC = 1
+    INTERMEDIATE = 2
+    ADVANCED = 3
+    EXPERT = 4
+    BREAKTHROUGH = 5
+
+class ReasoningType:
+    """Types of reasoning for the autonomous cognition loop"""
+    DEDUCTION = "deduction"  # Apply existing rules to derive conclusions
+    ABDUCTION = "abduction"  # Generate most plausible hypothesis from observations
+    INDUCTION = "induction"  # Derive general rules from specific instances
+    TRIAL_ERROR = "trial_error"  # Experiment with variations and learn from results
+
+class AutonomousSelfTrainer:
+    """Autonomous self-training system that enables SAM to evolve through self-created tasks,
+    self-verification, and self-reinforcement without requiring human-annotated data."""
+
+    def __init__(self, model):
+        """Initialize the autonomous self-trainer with a reference to the SAM model"""
+        self.model = model
+        self.config = model.config
+
+        # Components for autonomous training
+        self.task_generator = TaskGenerator(self)
+        self.solution_verifier = SolutionVerifier(self)
+        self.reward_model = RewardModel(self)
+        self.reasoning_engine = ReasoningEngine(self)
+
+        # Training metrics
+        self.training_cycles = 0
+        self.successful_verifications = 0
+        self.current_difficulty = TaskDifficulty.FOUNDATIONAL
+        self.domain_competencies = {
+            TaskDomain.TEXT: 0.0,
+            TaskDomain.MATH: 0.0,
+            TaskDomain.CODE: 0.0,
+            TaskDomain.LOGIC: 0.0,
+            TaskDomain.CREATIVE: 0.0,
+            TaskDomain.MULTIMODAL: 0.0 if self.config.multimodal_enabled else None
+        }
+
+        # Training history
+        self.training_history = []
+
+        # Determine initial focus domains based on model's current state
+        self.active_domains = self._determine_initial_domains()
+
+        # Evolution tracking
+        self.evolution_metrics = {
+            "concept_growth_rate": 0.0,
+            "reasoning_depth": 0.0,
+            "verification_accuracy": 0.0,
+            "task_complexity": 0.0
+        }
+
+        logger.info("Autonomous Self-Trainer initialized")
+
+    def _determine_initial_domains(self):
+        """Determine which domains to focus on initially based on model state"""
+        # Always start with text and logic as foundational domains
+        domains = [TaskDomain.TEXT, TaskDomain.LOGIC]
+
+        # Check if the model has enough concepts for more complex domains
+        concept_stats = self.model.concept_bank.get_concept_stats()
+        if concept_stats["total_concepts"] > 1000:
+            domains.append(TaskDomain.MATH)
+        if concept_stats["total_concepts"] > 2000:
+            domains.append(TaskDomain.CODE)
+        if concept_stats["total_concepts"] > 5000:
+            domains.append(TaskDomain.CREATIVE)
+
+        # Add multimodal if enabled
+        if self.config.multimodal_enabled:
+            domains.append(TaskDomain.MULTIMODAL)
+
+        return domains
+
+    def start_autonomous_training(self, duration_minutes=10, cycles=None):
+        """Start autonomous training for a specified duration or number of cycles"""
+        logger.info(f"Starting autonomous training for {duration_minutes} minutes or {cycles} cycles")
+
+        start_time = time.time()
+        end_time = start_time + (duration_minutes * 60)
+        cycle_count = 0
+
+        # Store the model's training state
+        was_training = self.model.training
+        self.model.train()
+
+        try:
+            while (time.time() < end_time if cycles is None else cycle_count < cycles):
+                # Run a single training cycle
+                cycle_results = self.run_training_cycle()
+
+                # Record results
+                self.training_history.append(cycle_results)
+
+                # Update metrics
+                self._update_evolution_metrics(cycle_results)
+
+                # Consider difficulty progression
+                self._consider_difficulty_progression()
+
+                # Consider domain expansion
+                self._consider_domain_expansion()
+
+                # Increment counters
+                cycle_count += 1
+                self.training_cycles += 1
+
+                # Log progress
+                if cycle_count % 10 == 0:
+                    elapsed = time.time() - start_time
+                    logger.info(f"Completed {cycle_count} training cycles in {elapsed:.1f} seconds")
+
+                    # Run an evolution step periodically
+                    if cycle_count % 50 == 0:
+                        self.model.evolve()
+
+            # Final evolution step
+            self.model.evolve()
+
+            # Summarize training
+            training_summary = self._generate_training_summary(cycle_count, time.time() - start_time)
+            logger.info(f"Autonomous training completed: {training_summary}")
+
+            return training_summary
+
+        finally:
+            # Restore model's training state
+            if not was_training:
+                self.model.eval()
+
+    def run_training_cycle(self):
+        """Run a single autonomous training cycle"""
+        # 1. Select domain and difficulty based on current competencies
+        domain, difficulty = self.task_generator.select_domain_and_difficulty()
+
+        # 2. Generate a task
+        task, task_context = self.task_generator.generate_task(domain, difficulty)
+
+        # 3. Select reasoning approach
+        reasoning_type = self.reasoning_engine.select_reasoning_type(domain, task)
+
+        # 4. Generate solution using selected reasoning approach
+        solution, reasoning_trace = self.reasoning_engine.solve_task(task, task_context, reasoning_type)
+
+        # 5. Verify solution
+        verification_result, verification_score = self.solution_verifier.verify_solution(
+            task, task_context, solution, reasoning_trace
+        )
+
+        # 6. Apply reward based on verification
+        reward = self.reward_model.calculate_reward(
+            verification_result,
+            verification_score,
+            domain,
+            difficulty,
+            reasoning_type,
+            reasoning_trace
+        )
+
+        # 7. Apply the reward to model (reinforce connections)
+        self.reward_model.apply_reward(reward, reasoning_trace)
+
+        # 8. Record the experience
+        self._record_training_experience(
+            domain, difficulty, task, solution,
+            verification_result, reward, reasoning_type
+        )
+
+        # 9. Update domain competency
+        if verification_result:
+            self.successful_verifications += 1
+            self.domain_competencies[domain] += reward * 0.1
+        else:
+            self.domain_competencies[domain] -= 0.01  # Small penalty for failures
+
+        # Ensure competencies are within bounds
+        self.domain_competencies[domain] = max(0.0, min(5.0, self.domain_competencies[domain]))
+
+        # Return cycle results
+        return {
+            "cycle": self.training_cycles,
+            "domain": domain,
+            "difficulty": difficulty,
+            "task": task,
+            "solution": solution,
+            "reasoning_type": reasoning_type,
+            "verification_result": verification_result,
+            "verification_score": verification_score,
+            "reward": reward,
+            "competency_update": self.domain_competencies[domain]
+        }
+
+    def _record_training_experience(self, domain, difficulty, task, solution,
+                                   verification_result, reward, reasoning_type):
+        """Record the training experience in the model's experience manager"""
+        experience_type = "autonomous_training"
+        content = {
+            "domain": domain,
+            "difficulty": difficulty,
+            "task": task,
+            "solution": solution,
+            "verification_result": verification_result,
+            "reward": reward,
+            "reasoning_type": reasoning_type
+        }
+
+        metadata = {
+            "type": experience_type,
+            "timestamp": time.time(),
+            "training_cycle": self.training_cycles,
+            "successful": verification_result
+        }
+
+        # Private experiences that aren't shared with hive mind
+        self.model.experience_manager.record_experience(
+            experience_type, content, metadata, private=True, modality="text"
+        )
+
+    def _update_evolution_metrics(self, cycle_results):
+        """Update evolution metrics based on cycle results"""
+        # Update verification accuracy
+        total_verifications = max(1, self.training_cycles)
+        self.evolution_metrics["verification_accuracy"] = self.successful_verifications / total_verifications
+
+        # Update task complexity
+        self.evolution_metrics["task_complexity"] = self.current_difficulty / TaskDifficulty.BREAKTHROUGH
+
+        # Update concept growth rate
+        current_concepts = self.model.concept_bank.next_concept_id
+        if hasattr(self, "_last_concept_count"):
+            growth = (current_concepts - self._last_concept_count) / max(1, self._last_concept_count)
+            self.evolution_metrics["concept_growth_rate"] = growth
+        self._last_concept_count = current_concepts
+
+        # Update reasoning depth based on model's thought state depth
+        self.evolution_metrics["reasoning_depth"] = self.model.thought_state.thought_depth / self.model.thought_state.max_thought_depth
+
+    def _consider_difficulty_progression(self):
+        """Consider whether to progress to a higher difficulty level"""
+        # Check if we have enough successful verifications at current difficulty
+        success_threshold = 50 * (1 + self.current_difficulty)  # Higher threshold for higher difficulties
+
+        if self.successful_verifications >= success_threshold:
+            # Check if average competency across active domains is sufficient
+            active_competencies = [self.domain_competencies[d] for d in self.active_domains]
+            avg_competency = sum(active_competencies) / len(active_competencies)
+
+            if avg_competency >= (self.current_difficulty + 0.7):  # Need 70%+ competency
+                if self.current_difficulty < TaskDifficulty.BREAKTHROUGH:
+                    self.current_difficulty += 1
+                    logger.info(f"Advanced to difficulty level: {self.current_difficulty}")
+                    self.successful_verifications = 0  # Reset counter
+
+    def _consider_domain_expansion(self):
+        """Consider whether to expand into new domains"""
+        # Don't expand if we're already covering all domains
+        all_domains = [d for d, c in self.domain_competencies.items() if c is not None]
+        if all(d in self.active_domains for d in all_domains):
+            return
+
+        # Check if we're doing well in current domains
+        active_competencies = [self.domain_competencies[d] for d in self.active_domains]
+        avg_competency = sum(active_competencies) / len(active_competencies)
+
+        if avg_competency >= 2.0 and len(self.active_domains) < len(all_domains):
+            # Find a domain to add
+            for domain in all_domains:
+                if domain not in self.active_domains:
+                    self.active_domains.append(domain)
+                    logger.info(f"Expanded training to new domain: {domain}")
+                    break
+
+    def _generate_training_summary(self, cycles, duration):
+        """Generate a summary of the training session"""
+        return {
+            "cycles_completed": cycles,
+            "duration_seconds": duration,
+            "current_difficulty": self.current_difficulty,
+            "active_domains": self.active_domains,
+            "domain_competencies": self.domain_competencies,
+            "successful_verifications": self.successful_verifications,
+            "evolution_metrics": self.evolution_metrics,
+            "concepts_created": self.model.concept_bank.next_concept_id - (getattr(self, "_last_concept_count", 0)),
+            "current_total_concepts": self.model.concept_bank.next_concept_id
+        }
+
+    def get_status(self):
+        """Get the current status of autonomous training"""
+        return {
+            "training_cycles": self.training_cycles,
+            "successful_verifications": self.successful_verifications,
+            "current_difficulty": self.current_difficulty,
+            "active_domains": self.active_domains,
+            "domain_competencies": self.domain_competencies,
+            "evolution_metrics": self.evolution_metrics
+        }
 
 
-def create_family_hive(base_config=None, member_count=3, save_dir="./family_hive"):
-    """Create a family of SAM instances sharing a hive mind"""
-    # Create base directory
-    os.makedirs(save_dir, exist_ok=True)
+class TaskGenerator:
+    """Generates tasks for autonomous self-training"""
 
-    # Create base configuration
-    if not base_config:
-        base_config = SAMConfig()
+    def __init__(self, trainer):
+        """Initialize the task generator with a reference to the trainer"""
+        self.trainer = trainer
+        self.model = trainer.model
 
-    # Set up hive config
-    base_config.hive_enabled = True
+        # Task templates by domain and difficulty
+        self.task_templates = self._initialize_task_templates()
 
-    # Create server instance
-    server_config = copy.deepcopy(base_config)
-    server_config.hive_server_mode = True
-    server_config.hive_identity = "family_hive_server"
-    server_config.save_dir = os.path.join(save_dir, "server")
+        # Domain selection probabilities (will be adjusted based on performance)
+        self.domain_selection_probs = {
+            TaskDomain.TEXT: 0.3,
+            TaskDomain.MATH: 0.2,
+            TaskDomain.CODE: 0.2,
+            TaskDomain.LOGIC: 0.2,
+            TaskDomain.CREATIVE: 0.1,
+            TaskDomain.MULTIMODAL: 0.0  # Start at 0, will be adjusted if enabled
+        }
 
-    logger.info("Creating family hive server...")
-    server_model, _ = create_sam_model(server_config, load_vocab=True, hive_mind=True)
-    server_model.save(os.path.join(save_dir, "server", "initial"))
+        # Adjust for multimodal if enabled
+        if self.trainer.config.multimodal_enabled:
+            self.domain_selection_probs[TaskDomain.MULTIMODAL] = 0.1
+            # Normalize probabilities
+            total = sum(self.domain_selection_probs.values())
+            for domain in self.domain_selection_probs:
+                self.domain_selection_probs[domain] /= total
 
-    # Create member instances
-    members = []
-    for i in range(member_count):
-        member_config = copy.deepcopy(base_config)
-        member_config.hive_server_url = "http://localhost:8765"  # Connect to server
-        member_config.hive_server_mode = False
-        member_config.hive_identity = f"family_member_{i+1}"
-        member_config.save_dir = os.path.join(save_dir, f"member_{i+1}")
+    def _initialize_task_templates(self):
+        """Initialize templates for different task types and difficulties"""
+        templates = {
+            TaskDomain.TEXT: {
+                TaskDifficulty.FOUNDATIONAL: [
+                    "Complete the following sentence: {context}",
+                    "What is the opposite of {concept}?",
+                    "Arrange these words in alphabetical order: {words}",
+                    "Identify the subject in this sentence: {sentence}"
+                ],
+                TaskDifficulty.BASIC: [
+                    "Summarize the following text in one sentence: {context}",
+                    "Find the main idea in this paragraph: {context}",
+                    "Correct any grammatical errors in this sentence: {sentence}",
+                    "What does {concept} mean in the context of {domain}?"
+                ],
+                # Additional levels would be defined similarly
+            },
+            TaskDomain.MATH: {
+                TaskDifficulty.FOUNDATIONAL: [
+                    "Calculate: {num1} + {num2}",
+                    "Calculate: {num1} - {num2}",
+                    "Calculate: {num1} × {num2}",
+                    "Calculate: {num1} ÷ {num2} (if division is possible)"
+                ],
+                TaskDifficulty.BASIC: [
+                    "Solve the equation: {num1}x + {num2} = {num3}",
+                    "Find the area of a rectangle with width {num1} and height {num2}",
+                    "What is {num1}% of {num2}?",
+                    "If {context}, what is the value of {variable}?"
+                ],
+                # Additional levels would be defined similarly
+            },
+            TaskDomain.CODE: {
+                TaskDifficulty.FOUNDATIONAL: [
+                    "Write a function that returns {output} when given {input}",
+                    "What does this code do? {code_snippet}",
+                    "Fix the error in this code: {buggy_code}",
+                    "Write a function called {function_name} that {function_description}"
+                ],
+                TaskDifficulty.BASIC: [
+                    "Implement a function to check if a number is prime",
+                    "Write a function to find the {n}th Fibonacci number",
+                    "Create a class called {class_name} with methods to {method_description}",
+                    "Optimize this code for better performance: {code_snippet}"
+                ],
+                # Additional levels would be defined similarly
+            },
+            TaskDomain.LOGIC: {
+                TaskDifficulty.FOUNDATIONAL: [
+                    "If {premise1} and {premise2}, what can you conclude?",
+                    "Identify whether this statement is true or false: {statement}",
+                    "What is the next number in this sequence: {sequence}",
+                    "Solve this puzzle: {puzzle_description}"
+                ],
+                TaskDifficulty.BASIC: [
+                    "If {premise}, what must be true? What could be true but isn't necessarily?",
+                    "Find the pattern in this sequence and predict the next three elements: {sequence}",
+                    "Evaluate this logical expression: {expression}",
+                    "Solve this riddle: {riddle}"
+                ],
+                # Additional levels would be defined similarly
+            },
+            TaskDomain.CREATIVE: {
+                TaskDifficulty.FOUNDATIONAL: [
+                    "Write a short poem about {topic}",
+                    "Create a metaphor that explains {concept}",
+                    "Describe a scene involving {element1} and {element2}",
+                    "Invent a character who is {trait1} and {trait2}"
+                ],
+                TaskDifficulty.BASIC: [
+                    "Write a short story that includes these elements: {elements}",
+                    "Create an analogy between {domain1} and {domain2}",
+                    "Design a product that solves this problem: {problem}",
+                    "Write dialogue between two characters who disagree about {topic}"
+                ],
+                # Additional levels would be defined similarly
+            }
+        }
 
-        logger.info(f"Creating family member {i+1}...")
-        member_model, _ = create_sam_model(member_config, load_vocab=True, hive_mind=True)
-        member_model.save(os.path.join(save_dir, f"member_{i+1}", "initial"))
+        # Add multimodal tasks if enabled
+        if self.trainer.config.multimodal_enabled:
+            templates[TaskDomain.MULTIMODAL] = {
+                TaskDifficulty.FOUNDATIONAL: [
+                    "Describe what might be in this image: {image_description}",
+                    "How might this sound be represented visually: {sound_description}",
+                    "Create text that would accompany this image: {image_description}",
+                    "What emotions might this music evoke: {music_description}"
+                ],
+                TaskDifficulty.BASIC: [
+                    "If this image {image_description} and this sound {sound_description} were combined, what might it represent?",
+                    "Create a story that incorporates this visual scene: {image_description}",
+                    "Describe how {concept} might be represented across different modalities",
+                    "Convert this textual description into a visual scene: {description}"
+                ],
+                # Additional levels would be defined similarly
+            }
 
-        members.append(member_model)
+        return templates
 
-    # Start server services
-    server_model.start_services()
+    def select_domain_and_difficulty(self):
+        """Select a domain and difficulty level for the next task"""
+        # Only select from active domains
+        active_probs = {d: self.domain_selection_probs[d] for d in self.trainer.active_domains}
+        total = sum(active_probs.values())
+        active_probs = {d: p/total for d, p in active_probs.items()}
 
-    # Return family
-    return {
-        "server": server_model,
-        "members": members,
-        "save_dir": save_dir
-    }
+        # Select domain based on probabilities
+        domain = random.choices(
+            list(active_probs.keys()),
+            weights=list(active_probs.values()),
+            k=1
+        )[0]
 
+        # Select difficulty - usually current difficulty, but occasionally one level lower or higher
+        difficulty_options = [max(0, self.trainer.current_difficulty - 1),
+                            self.trainer.current_difficulty,
+                            min(TaskDifficulty.BREAKTHROUGH, self.trainer.current_difficulty + 1)]
+
+        difficulty_weights = [0.2, 0.6, 0.2]  # Mostly current, sometimes adjacent
+
+        difficulty = random.choices(difficulty_options, weights=difficulty_weights, k=1)[0]
+
+        return domain, difficulty
+
+    def generate_task(self, domain, difficulty):
+        """Generate a specific task for the given domain and difficulty"""
+        # Get templates for the domain and difficulty
+        if difficulty not in self.task_templates.get(domain, {}):
+            # Fallback to the highest available difficulty
+            available_difficulties = sorted(self.task_templates.get(domain, {}).keys())
+            if not available_difficulties:
+                # No templates for this domain, fall back to TEXT domain
+                domain = TaskDomain.TEXT
+                available_difficulties = sorted(self.task_templates[domain].keys())
+
+            difficulty = max(d for d in available_difficulties if d <= difficulty)
+
+        templates = self.task_templates[domain][difficulty]
+
+        # Select a template
+        template = random.choice(templates)
+
+        # Generate context for the template
+        context = self._generate_context(domain, difficulty, template)
+
+        # Fill in the template
+        task = self._fill_template(template, context)
+
+        return task, context
+
+    def _generate_context(self, domain, difficulty, template):
+        """Generate context appropriate for the domain, difficulty, and template"""
+        # This would be a complex method that creates appropriate task contexts
+        # For this implementation, I'll provide a simplified version
+
+        context = {}
+
+        if domain == TaskDomain.TEXT:
+            # Generate text-related context
+            if "concept" in template:
+                concepts = ["knowledge", "information", "communication", "language",
+                           "expression", "meaning", "understanding", "interpretation"]
+                context["concept"] = random.choice(concepts)
+
+            if "sentence" in template:
+                sentences = [
+                    "The quick brown fox jumps over the lazy dog.",
+                    "She sells seashells by the seashore.",
+                    "The cat sat on the mat while the dog barked loudly.",
+                    "To be or not to be, that is the question."
+                ]
+                context["sentence"] = random.choice(sentences)
+
+            if "context" in template:
+                paragraphs = [
+                    "Artificial intelligence is transforming how we interact with technology. From voice assistants to predictive text, AI systems are becoming increasingly integrated into our daily lives.",
+                    "The human brain contains approximately 86 billion neurons. These cells communicate through electrochemical signals, forming the basis of all thoughts, feelings, and actions.",
+                    "Climate change poses significant challenges to global ecosystems. Rising temperatures affect weather patterns, sea levels, and biodiversity around the world."
+                ]
+                context["context"] = random.choice(paragraphs)
+
+            if "words" in template:
+                word_sets = [
+                    "apple banana cherry date elderberry fig",
+                    "python java ruby javascript typescript",
+                    "mercury venus earth mars jupiter saturn"
+                ]
+                context["words"] = random.choice(word_sets)
+
+        elif domain == TaskDomain.MATH:
+            # Generate math-related context
+            difficulty_factor = difficulty + 1
+
+            context["num1"] = random.randint(1, 10 * difficulty_factor)
+            context["num2"] = random.randint(1, 10 * difficulty_factor)
+
+            if difficulty >= TaskDifficulty.BASIC:
+                context["num3"] = random.randint(1, 20 * difficulty_factor)
+                context["variable"] = random.choice(["x", "y", "z", "a", "b", "c"])
+
+            if "equation" in template:
+                # Generate simple equation context
+                a = random.randint(1, 5 * difficulty_factor)
+                b = random.randint(1, 10 * difficulty_factor)
+                x = random.randint(1, 10)
+                c = a * x + b
+                context["num1"] = a
+                context["num2"] = b
+                context["num3"] = c
+
+        elif domain == TaskDomain.CODE:
+            # Generate code-related context
+            if "function_name" in template:
+                function_names = ["calculate_average", "find_maximum", "is_prime",
+                                 "reverse_string", "count_words", "sort_numbers"]
+                context["function_name"] = random.choice(function_names)
+
+            if "function_description" in template:
+                descriptions = [
+                    "takes a list of numbers and returns their average",
+                    "checks if a string is a palindrome",
+                    "counts the frequency of each word in a text",
+                    "finds the greatest common divisor of two numbers"
+                ]
+                context["function_description"] = random.choice(descriptions)
+
+            if "buggy_code" in template:
+                buggy_codes = [
+                    "def sum_list(numbers):\n    total = 0\n    for num in numbers\n        total += num\n    return total",
+                    "def find_max(numbers):\n    if len(numbers) == 0:\n        return None\n    max_num = numbers[0]\n    for num in numbers:\n        if num < max_num:\n            max_num = num\n    return max_num"
+                ]
+                context["buggy_code"] = random.choice(buggy_codes)
+
+            if "code_snippet" in template:
+                snippets = [
+                    "def factorial(n):\n    if n == 0:\n        return 1\n    else:\n        return n * factorial(n-1)",
+                    "def fibonacci(n):\n    if n <= 1:\n        return n\n    else:\n        return fibonacci(n-1) + fibonacci(n-2)"
+                ]
+                context["code_snippet"] = random.choice(snippets)
+
+        elif domain == TaskDomain.LOGIC:
+            # Generate logic-related context
+            if "sequence" in template:
+                sequences = [
+                    "2, 4, 6, 8, ...",
+                    "1, 3, 9, 27, ...",
+                    "1, 1, 2, 3, 5, 8, ...",
+                    "3, 1, 4, 1, 5, 9, ..."
+                ]
+                context["sequence"] = random.choice(sequences)
+
+            if "premise1" in template and "premise2" in template:
+                premise_pairs = [
+                    ["All men are mortal", "Socrates is a man"],
+                    ["If it rains, the ground gets wet", "It is raining"],
+                    ["Either the butler or the maid did it", "The butler has an alibi"]
+                ]
+                selected = random.choice(premise_pairs)
+                context["premise1"] = selected[0]
+                context["premise2"] = selected[1]
+
+            if "statement" in template:
+                statements = [
+                    "If a number is divisible by 4, then it is divisible by 2",
+                    "If a shape is a square, then it is a rectangle",
+                    "If a number is prime, then it is odd"
+                ]
+                context["statement"] = random.choice(statements)
+
+            if "puzzle_description" in template:
+                puzzles = [
+                    "Three people need to cross a bridge at night, and they have only one flashlight. The bridge can only hold two people at a time, and the flashlight must be with anyone crossing. Person A takes 1 minute to cross, Person B takes 2 minutes, and Person C takes 5 minutes. When two people cross together, they move at the slower person's pace. What is the minimum time needed for all three to cross?",
+                    "A man has to get a fox, a chicken, and a sack of corn across a river. He has a rowboat, and it can only carry him and one other thing. If the fox and the chicken are left together, the fox will eat the chicken. If the chicken and the corn are left together, the chicken will eat the corn. How does he do it?"
+                ]
+                context["puzzle_description"] = random.choice(puzzles)
+
+        elif domain == TaskDomain.CREATIVE:
+            # Generate creative-related context
+            if "topic" in template:
+                topics = ["nature", "technology", "time", "dreams", "freedom", "change"]
+                context["topic"] = random.choice(topics)
+
+            if "concept" in template:
+                concepts = ["gravity", "evolution", "democracy", "happiness", "knowledge"]
+                context["concept"] = random.choice(concepts)
+
+            if "element1" in template and "element2" in template:
+                elements = ["water", "fire", "earth", "air", "metal", "wood", "light", "darkness"]
+                random.shuffle(elements)
+                context["element1"] = elements[0]
+                context["element2"] = elements[1]
+
+            if "trait1" in template and "trait2" in template:
+                traits = ["brave", "curious", "wise", "mischievous", "determined", "compassionate"]
+                random.shuffle(traits)
+                context["trait1"] = traits[0]
+                context["trait2"] = traits[1]
+
+        elif domain == TaskDomain.MULTIMODAL and self.trainer.config.multimodal_enabled:
+            # Generate multimodal-related context
+            if "image_description" in template:
+                descriptions = [
+                    "a mountain landscape at sunset",
+                    "a busy city street with people and cars",
+                    "a close-up of a flower with a bee collecting pollen",
+                    "a child playing with a colorful toy"
+                ]
+                context["image_description"] = random.choice(descriptions)
+
+            if "sound_description" in template:
+                sounds = [
+                    "ocean waves crashing on a beach",
+                    "birds singing in a forest",
+                    "a jazz band playing in a small club",
+                    "a thunderstorm with heavy rain"
+                ]
+                context["sound_description"] = random.choice(sounds)
+
+            if "music_description" in template:
+                music = [
+                    "a soft piano melody in a minor key",
+                    "an upbeat electronic dance track with a strong bass",
+                    "a classical orchestra playing a dramatic crescendo",
+                    "a folk song with acoustic guitar and gentle vocals"
+                ]
+                context["music_description"] = random.choice(music)
+
+        return context
+
+    def _fill_template(self, template, context):
+        """Fill a template with context values"""
+        filled_template = template
+
+        for key, value in context.items():
+            placeholder = "{" + key + "}"
+            if placeholder in filled_template:
+                filled_template = filled_template.replace(placeholder, str(value))
+
+        return filled_template
+
+
+class SolutionVerifier:
+    """Verifies the correctness of solutions to self-generated tasks"""
+
+    def __init__(self, trainer):
+        """Initialize the solution verifier with a reference to the trainer"""
+        self.trainer = trainer
+        self.model = trainer.model
+
+        # Verification methods by domain
+        self.verification_methods = {
+            TaskDomain.TEXT: self._verify_text_solution,
+            TaskDomain.MATH: self._verify_math_solution,
+            TaskDomain.CODE: self._verify_code_solution,
+            TaskDomain.LOGIC: self._verify_logic_solution,
+            TaskDomain.CREATIVE: self._verify_creative_solution
+        }
+
+        # Add multimodal verification if enabled
+        if self.trainer.config.multimodal_enabled:
+            self.verification_methods[TaskDomain.MULTIMODAL] = self._verify_multimodal_solution
+
+        # Verification statistics
+        self.verification_history = []
+
+    def verify_solution(self, task, task_context, solution, reasoning_trace):
+        """Verify a solution to a task"""
+        # Extract domain from task string or context
+        domain = self._infer_domain_from_task(task, task_context)
+
+        # Use appropriate verification method
+        verification_method = self.verification_methods.get(domain, self._verify_generic_solution)
+        verification_result, verification_score = verification_method(task, task_context, solution, reasoning_trace)
+
+        # Record verification result
+        self.verification_history.append({
+            "task": task,
+            "solution": solution,
+            "verification_result": verification_result,
+            "verification_score": verification_score,
+            "domain": domain,
+            "timestamp": time.time()
+        })
+
+        return verification_result, verification_score
+
+    def _infer_domain_from_task(self, task, task_context):
+        """Infer the domain of a task from its content"""
+        # If domain is explicitly in context, use it
+        if "domain" in task_context:
+            return task_context["domain"]
+
+        # Try to detect domain from task content
+        task_lower = task.lower()
+
+        # Check for code-related keywords
+        if any(kw in task_lower for kw in ["function", "code", "programming", "algorithm", "class", "method"]):
+            return TaskDomain.CODE
+
+        # Check for math-related keywords
+        if any(kw in task_lower for kw in ["calculate", "equation", "solve", "math", "formula", "number", "geometry"]):
+            return TaskDomain.MATH
+
+        # Check for logic-related keywords
+        if any(kw in task_lower for kw in ["logic", "puzzle", "sequence", "pattern", "deduce", "conclusion"]):
+            return TaskDomain.LOGIC
+
+        # Check for creative-related keywords
+        if any(kw in task_lower for kw in ["create", "invent", "design", "story", "poem", "character", "scene"]):
+            return TaskDomain.CREATIVE
+
+        # Check for multimodal-related keywords
+        if any(kw in task_lower for kw in ["image", "picture", "sound", "audio", "visual", "music"]):
+            return TaskDomain.MULTIMODAL if self.trainer.config.multimodal_enabled else TaskDomain.TEXT
+
+        # Default to text domain
+        return TaskDomain.TEXT
+
+    def _verify_generic_solution(self, task, task_context, solution, reasoning_trace):
+        """Generic verification method used as fallback"""
+        # This is a minimal implementation that could be enhanced
+
+        # Check if solution is non-empty and reasonable length
+        if not solution or len(solution) < 5:
+            return False, 0.0
+
+        # Check that solution is relevant to task
+        task_words = set(task.lower().split())
+        solution_words = set(solution.lower().split())
+
+        relevance_score = len(task_words.intersection(solution_words)) / max(1, len(task_words))
+
+        # Check for reasoning quality
+        reasoning_quality = min(1.0, len(reasoning_trace) / 200)  # Reward more thorough reasoning
+
+        # Combine scores
+        verification_score = 0.4 * relevance_score + 0.6 * reasoning_quality
+
+        # Success threshold
+        return verification_score > 0.4, verification_score
+
+    def _verify_text_solution(self, task, task_context, solution, reasoning_trace):
+        """Verify a solution to a text-related task"""
+        # Basic verification - could be much more sophisticated
+
+        # For sentence completion tasks
+        if "Complete the following sentence" in task:
+            if "sentence" in task_context and solution.startswith(task_context["sentence"]):
+                return True, 0.8
+            # Check if solution is a complete sentence
+            if solution.endswith(".") or solution.endswith("!") or solution.endswith("?"):
+                return True, 0.6
+            return False, 0.3
+
+        # For opposite tasks
+        if "What is the opposite of" in task:
+            if "concept" in task_context:
+                # Since we can't use external knowledge reliably here, just check that
+                # the solution isn't the same as the concept
+                if task_context["concept"].lower() not in solution.lower():
+                    return True, 0.7
+            return False, 0.2
+
+        # For alphabetical ordering
+        if "Arrange these words in alphabetical order" in task:
+            if "words" in task_context:
+                original_words = task_context["words"].split()
+                solution_words = solution.split()
+
+                # Check if solution has same number of words
+                if len(original_words) != len(solution_words):
+                    return False, 0.1
+
+                # Check if solution is alphabetically sorted
+                sorted_words = sorted(original_words)
+                if solution_words == sorted_words:
+                    return True, 1.0
+
+                # Partial credit for partially correct ordering
+                correct_positions = sum(1 for a, b in zip(solution_words, sorted_words) if a == b)
+                return False, correct_positions / len(original_words)
+
+        # Fall back to generic verification
+        return self._verify_generic_solution(task, task_context, solution, reasoning_trace)
+
+    def _verify_math_solution(self, task, task_context, solution, reasoning_trace):
+        """Verify a solution to a math-related task"""
+        # Extract expected result for simple arithmetic tasks
+        if "Calculate:" in task:
+            try:
+                # Parse the expected result
+                if "num1" in task_context and "num2" in task_context:
+                    num1 = task_context["num1"]
+                    num2 = task_context["num2"]
+
+                    # Determine operation
+                    if "+" in task:
+                        expected = num1 + num2
+                    elif "-" in task:
+                        expected = num1 - num2
+                    elif "×" in task or "*" in task:
+                        expected = num1 * num2
+                    elif "÷" in task or "/" in task:
+                        expected = num1 / num2 if num2 != 0 else None
+                    else:
+                        return self._verify_generic_solution(task, task_context, solution, reasoning_trace)
+
+                    # Extract numeric answer from solution
+                    answer = self._extract_numeric_answer(solution)
+
+                    if answer is not None and expected is not None:
+                        # Check if answer is correct (with small tolerance for division)
+                        if abs(answer - expected) < 0.01:
+                            return True, 1.0
+                        else:
+                            # Score based on how close the answer is
+                            error_ratio = min(1.0, abs(answer - expected) / max(1.0, abs(expected)))
+                            score = max(0.0, 1.0 - error_ratio)
+                            return False, score
+            except:
+                # If parsing fails, fall back to generic verification
+                pass
+
+        # For solving equations
+        if "Solve the equation:" in task:
+            try:
+                if "num1" in task_context and "num2" in task_context and "num3" in task_context:
+                    a = task_context["num1"]
+                    b = task_context["num2"]
+                    c = task_context["num3"]
+
+                    # Calculate expected value of x
+                    expected = (c - b) / a
+
+                    # Extract numeric answer
+                    answer = self._extract_numeric_answer(solution)
+
+                    if answer is not None:
+                        # Check if answer is correct (with small tolerance)
+                        if abs(answer - expected) < 0.01:
+                            return True, 1.0
+                        else:
+                            # Score based on how close the answer is
+                            error_ratio = min(1.0, abs(answer - expected) / max(1.0, abs(expected)))
+                            score = max(0.0, 1.0 - error_ratio)
+                            return False, score
+            except:
+                pass
+
+        # Fall back to generic verification
+        return self._verify_generic_solution(task, task_context, solution, reasoning_trace)
+
+    def _extract_numeric_answer(self, text):
+        """Extract a numeric answer from a text solution"""
+        import re
+
+        # Try to find numbers in the text
+        matches = re.findall(r'-?\d+\.?\d*', text)
+
+        if matches:
+            # Return the last number found (usually the final answer)
+            try:
+                return float(matches[-1])
+            except:
+                pass
+
+        return None
+
+    def _verify_code_solution(self, task, task_context, solution, reasoning_trace):
+        """Verify a solution to a code-related task"""
+        # For function writing tasks
+        if "Write a function" in task or "Implement a function" in task:
+            # Check if solution contains a function definition
+            if "def " in solution and "return" in solution:
+                # Simple syntax check
+                try:
+                    # Just check if it can be parsed, don't execute
+                    compile(solution, '<string>', 'exec')
+
+                    # Can't run code fully without using exec, so we rely on heuristics
+                    # Check for proper indentation
+                    lines = solution.strip().split('\n')
+                    if len(lines) < 2:
+                        return False, 0.2
+
+                    # Check for indentation after function definition
+                    if not any(line.startswith('    ') or line.startswith('\t') for line in lines[1:]):
+                        return False, 0.3
+
+                    # Check for function name match if requested
+                    if "function_name" in task_context:
+                        if f"def {task_context['function_name']}" in solution:
+                            return True, 0.9
+                        return False, 0.4
+
+                    # Generic success for syntactically valid function
+                    return True, 0.7
+                except (SyntaxError, IndentationError):
+                    return False, 0.1
+
+        # For fixing buggy code
+        if "Fix the error" in task and "buggy_code" in task_context:
+            buggy_code = task_context["buggy_code"]
+
+            # Check if solution is different from buggy code
+            if solution == buggy_code:
+                return False, 0.0
+
+            # Check if solution is syntactically valid
+            try:
+                compile(solution, '<string>', 'exec')
+
+                # Compare key elements to see if error was fixed
+                buggy_lines = set(buggy_code.split('\n'))
+                solution_lines = set(solution.split('\n'))
+
+                # Check how many lines were changed
+                changes = len(buggy_lines.symmetric_difference(solution_lines))
+
+                # Good fixes typically change a small number of lines
+                if 0 < changes <= 3:
+                    return True, 0.8
+                if changes > 3:
+                    return True, 0.6  # Still valid but maybe not optimal
+
+                return False, 0.3
+            except (SyntaxError, IndentationError):
+                return False, 0.1
+
+        # For code analysis tasks
+        if "What does this code do?" in task and "code_snippet" in task_context:
+            # No way to automatically verify correctness of analysis
+            # Check for relevance to code snippet
+            code_words = set(re.findall(r'\w+', task_context["code_snippet"]))
+            solution_words = set(re.findall(r'\w+', solution))
+
+            overlap = len(code_words.intersection(solution_words)) / max(1, len(code_words))
+
+            # Check for explanation-related terms
+            explanation_terms = ["function", "returns", "calculates", "computes", "iterates", "checks"]
+            has_explanation_terms = any(term in solution.lower() for term in explanation_terms)
+
+            score = 0.5 * overlap + 0.5 * float(has_explanation_terms)
+            return score > 0.6, score
+
+        # Fall back to generic verification
+        return self._verify_generic_solution(task, task_context, solution, reasoning_trace)
+
+    def _verify_logic_solution(self, task, task_context, solution, reasoning_trace):
+        """Verify a solution to a logic-related task"""
+        # For sequence continuation
+        if "sequence" in task_context and ("next number" in task or "next element" in task):
+            sequence_str = task_context["sequence"]
+
+            # For common sequences, we can check the answer
+            sequence = [int(n.strip()) for n in sequence_str.split(',') if n.strip().isdigit()]
+
+            if len(sequence) >= 3:
+                # Try to extract the answer from solution
+                answer = self._extract_numeric_answer(solution)
+
+                if answer is not None:
+                    # Check for arithmetic sequence
+                    if len(sequence) >= 2 and all(sequence[i+1] - sequence[i] == sequence[1] - sequence[0] for i in range(len(sequence)-2)):
+                        diff = sequence[1] - sequence[0]
+                        expected = sequence[-1] + diff
+                        if abs(answer - expected) < 0.01:
+                            return True, 1.0
+
+                    # Check for geometric sequence
+                    if len(sequence) >= 2 and all(sequence[i+1] / sequence[i] == sequence[1] / sequence[0] for i in range(len(sequence)-2)) and sequence[0] != 0:
+                        ratio = sequence[1] / sequence[0]
+                        expected = sequence[-1] * ratio
+                        if abs(answer - expected) < 0.01:
+                            return True, 1.0
+
+                    # Check for Fibonacci-like sequence
+                    if len(sequence) >= 3 and all(sequence[i+2] == sequence[i+1] + sequence[i] for i in range(len(sequence)-3)):
+                        expected = sequence[-1] + sequence[-2]
+                        if abs(answer - expected) < 0.01:
+                            return True, 1.0
+
+                    # For other sequences, we can't easily verify
+                    return False, 0.5
+
+        # For true/false questions
+        if "statement" in task_context and "true or false" in task.lower():
+            # For some statements we know the answer
+            statement = task_context["statement"].lower()
+
+            known_answers = {
+                "if a number is divisible by 4, then it is divisible by 2": True,
+                "if a shape is a square, then it is a rectangle": True,
+                "if a number is prime, then it is odd": False  # 2 is prime but even
+            }
+
+            if statement in known_answers:
+                expected = known_answers[statement]
+                if ("true" in solution.lower() and expected) or ("false" in solution.lower() and not expected):
+                    return True, 1.0
+                else:
+                    return False, 0.0
+
+        # For logical deduction with premises
+        if "premise1" in task_context and "premise2" in task_context and "conclude" in task:
+            # Some specific known valid conclusions
+            premise_pair = (task_context["premise1"], task_context["premise2"])
+
+            known_conclusions = {
+                ("All men are mortal", "Socrates is a man"): "Socrates is mortal",
+                ("If it rains, the ground gets wet", "It is raining"): "The ground gets wet",
+                ("Either the butler or the maid did it", "The butler has an alibi"): "The maid did it"
+            }
+
+            if premise_pair in known_conclusions:
+                expected = known_conclusions[premise_pair]
+                similarity = self._text_similarity(expected, solution)
+                if similarity > 0.7:
+                    return True, similarity
+                return False, similarity * 0.5
+
+        # Fall back to generic verification
+        return self._verify_generic_solution(task, task_context, solution, reasoning_trace)
+
+    def _verify_creative_solution(self, task, task_context, solution, reasoning_trace):
+        """Verify a solution to a creative task"""
+        # Creative tasks are inherently subjective, so we look for structural elements
+
+        # For poetry tasks
+        if "poem" in task.lower() and "topic" in task_context:
+            topic = task_context["topic"]
+
+            # Check if solution contains the topic
+            topic_present = topic.lower() in solution.lower()
+
+            # Check if it has multiple lines (basic poem structure)
+            multiple_lines = solution.count('\n') >= 2
+
+            # Check for poetic devices (very simple check)
+            poetic_elements = any(device in solution.lower() for device in
+                                ["like", "as", "metaphor", "simile", "rhythm", "rhyme"])
+
+            score = 0.3 * float(topic_present) + 0.3 * float(multiple_lines) + 0.4 * float(poetic_elements)
+            return score >= 0.6, score
+
+        # For character creation
+        if "character" in task.lower() and "trait1" in task_context and "trait2" in task_context:
+            trait1 = task_context["trait1"]
+            trait2 = task_context["trait2"]
+
+            # Check if both traits are mentioned
+            trait1_present = trait1.lower() in solution.lower()
+            trait2_present = trait2.lower() in solution.lower()
+
+            # Check for character development elements
+            character_elements = any(element in solution.lower() for element in
+                                   ["name", "background", "history", "appearance", "motivation"])
+
+            score = 0.4 * float(trait1_present) + 0.4 * float(trait2_present) + 0.2 * float(character_elements)
+            return score >= 0.6, score
+
+        # For metaphor creation
+        if "metaphor" in task.lower() and "concept" in task_context:
+            concept = task_context["concept"]
+
+            # Check if concept is mentioned
+            concept_present = concept.lower() in solution.lower()
+
+            # Check for comparison language
+            comparison = any(word in solution.lower() for word in
+                           ["like", "as", "is", "resembles", "similar", "compared"])
+
+            score = 0.5 * float(concept_present) + 0.5 * float(comparison)
+            return score >= 0.7, score
+
+        # For story writing
+        if "story" in task.lower() and "elements" in task_context:
+            elements = task_context.get("elements", "").split()
+
+            # Check if elements are included
+            element_count = sum(1 for element in elements if element.lower() in solution.lower())
+            element_ratio = element_count / max(1, len(elements))
+
+            # Check for story structure (very simple)
+            has_structure = "beginning" in solution.lower() or "end" in solution.lower() or solution.count('\n') >= 3
+
+            score = 0.7 * element_ratio + 0.3 * float(has_structure)
+            return score >= 0.6, score
+
+        # Fall back to generic verification
+        return self._verify_generic_solution(task, task_context, solution, reasoning_trace)
+
+    def _verify_multimodal_solution(self, task, task_context, solution, reasoning_trace):
+        """Verify a solution to a multimodal task"""
+        # For image description tasks
+        if "image_description" in task_context:
+            image_desc = task_context["image_description"]
+
+            # Check if solution relates to the image description
+            related_to_image = self._text_similarity(image_desc, solution) > 0.3
+
+            # Check for visual language
+            visual_terms = ["see", "look", "appear", "visual", "image", "picture", "scene",
+                          "view", "perspective", "foreground", "background", "color"]
+
+            has_visual_terms = any(term in solution.lower() for term in visual_terms)
+
+            score = 0.6 * float(related_to_image) + 0.4 * float(has_visual_terms)
+            return score >= 0.5, score
+
+        # For sound/audio description tasks
+        if "sound_description" in task_context or "music_description" in task_context:
+            audio_desc = task_context.get("sound_description", task_context.get("music_description", ""))
+
+            # Check if solution relates to the audio description
+            related_to_audio = self._text_similarity(audio_desc, solution) > 0.3
+
+            # Check for auditory language
+            audio_terms = ["hear", "sound", "audio", "noise", "music", "rhythm", "melody",
+                         "tempo", "beat", "listen", "loud", "soft", "pitch", "tone"]
+
+            has_audio_terms = any(term in solution.lower() for term in audio_terms)
+
+            score = 0.6 * float(related_to_audio) + 0.4 * float(has_audio_terms)
+            return score >= 0.5, score
+
+        # For cross-modal integration tasks
+        if "image_description" in task_context and ("sound_description" in task_context or "music_description" in task_context):
+            # Check for integration of both modalities
+            image_desc = task_context["image_description"]
+            audio_desc = task_context.get("sound_description", task_context.get("music_description", ""))
+
+            # Check if solution relates to both descriptions
+            related_to_image = self._text_similarity(image_desc, solution) > 0.2
+            related_to_audio = self._text_similarity(audio_desc, solution) > 0.2
+
+            # Check for integration language
+            integration_terms = ["combine", "together", "mix", "blend", "harmony",
+                               "integrated", "synchronized", "paired", "matched"]
+
+            has_integration_terms = any(term in solution.lower() for term in integration_terms)
+
+            score = 0.4 * float(related_to_image) + 0.4 * float(related_to_audio) + 0.2 * float(has_integration_terms)
+            return score >= 0.6, score
+
+        # Fall back to generic verification
+        return self._verify_generic_solution(task, task_context, solution, reasoning_trace)
+
+    def _text_similarity(self, text1, text2):
+        """Calculate a simple similarity score between two texts"""
+        words1 = set(text1.lower().split())
+        words2 = set(text2.lower().split())
+
+        intersection = words1.intersection(words2)
+        union = words1.union(words2)
+
+        return len(intersection) / max(1, len(union))
+
+
+class RewardModel:
+    """Calculates and applies rewards for autonomous learning"""
+
+    def __init__(self, trainer):
+        """Initialize the reward model with a reference to the trainer"""
+        self.trainer = trainer
+        self.model = trainer.model
+
+        # Domain-specific reward modifiers
+        self.domain_reward_modifiers = {
+            TaskDomain.TEXT: 1.0,
+            TaskDomain.MATH: 1.2,  # Slightly higher reward for math (harder to verify)
+            TaskDomain.CODE: 1.2,  # Slightly higher reward for code (harder to verify)
+            TaskDomain.LOGIC: 1.1,  # Slightly higher reward for logic
+            TaskDomain.CREATIVE: 0.9,  # Slightly lower reward for creative (easier to "game")
+            TaskDomain.MULTIMODAL: 1.3 if self.trainer.config.multimodal_enabled else 0.0  # Higher reward for multimodal
+        }
+
+        # Reasoning type reward modifiers
+        self.reasoning_reward_modifiers = {
+            ReasoningType.DEDUCTION: 1.0,
+            ReasoningType.ABDUCTION: 1.1,  # Slightly higher reward for abduction (more creative)
+            ReasoningType.INDUCTION: 1.2,  # Higher reward for induction (more generalizable)
+            ReasoningType.TRIAL_ERROR: 0.9  # Slightly lower reward for trial & error
+        }
+
+        # Reward history
+        self.reward_history = []
+
+    def calculate_reward(self, verification_result, verification_score, domain, difficulty, reasoning_type, reasoning_trace):
+        """Calculate the reward for a solution"""
+        # Base reward depends on verification result and score
+        base_reward = verification_score
+
+        # Apply domain-specific modifier
+        domain_modifier = self.domain_reward_modifiers.get(domain, 1.0)
+
+        # Apply reasoning type modifier
+        reasoning_modifier = self.reasoning_reward_modifiers.get(reasoning_type, 1.0)
+
+        # Apply difficulty modifier (higher reward for harder tasks)
+        difficulty_modifier = 1.0 + (difficulty * 0.2)  # +20% per difficulty level
+
+        # Apply reasoning trace quality modifier
+        trace_quality = min(1.0, len(reasoning_trace) / 500)  # Cap at 1.0
+        trace_modifier = 0.8 + (0.4 * trace_quality)  # 0.8 to 1.2 based on trace quality
+
+        # Calculate final reward
+        reward = base_reward * domain_modifier * reasoning_modifier * difficulty_modifier * trace_modifier
+
+        # Cap reward to reasonable range
+        reward = max(0.0, min(2.0, reward))
+
+        # Record reward
+        self.reward_history.append({
+            "verification_result": verification_result,
+            "verification_score": verification_score,
+            "domain": domain,
+            "difficulty": difficulty,
+            "reasoning_type": reasoning_type,
+            "reward": reward,
+            "timestamp": time.time()
+        })
+
+        return reward
+
+    def apply_reward(self, reward, reasoning_trace):
+        """Apply the reward to the model to reinforce learning"""
+        # This is where we would apply reinforcement to the model
+        # For SAM, we can reinforce concepts and connections based on the reasoning trace
+
+        # Only apply significant rewards
+        if reward < 0.1:
+            return
+
+        # Get concepts involved in the reasoning trace
+        concepts_involved = self._extract_concepts_from_trace(reasoning_trace)
+
+        # Apply reward proportionally to these concepts
+        for concept_id, importance in concepts_involved:
+            # Strengthen concept usage
+            if concept_id < len(self.model.concept_bank.concept_frequencies):
+                with torch.no_grad():
+                    # Increase frequency by an amount proportional to reward and importance
+                    adjustment = int(reward * 10 * importance)
+                    if adjustment > 0:
+                        self.model.concept_bank.concept_frequencies[concept_id] += adjustment
+
+                        # Also strengthen related concepts
+                        if concept_id in self.model.concept_bank.related_concepts:
+                            for related_id in self.model.concept_bank.related_concepts[concept_id][:3]:  # Top 3
+                                if related_id < len(self.model.concept_bank.concept_frequencies):
+                                    self.model.concept_bank.concept_frequencies[related_id] += adjustment // 2
+
+        # If significant reward, consider personalizing key concepts
+        if reward > 1.0 and hasattr(self.model, "consciousness"):
+            for concept_id, importance in concepts_involved[:3]:  # Top 3 concepts
+                self.model.consciousness.personalize_concept(concept_id, reward * 0.05)
+
+    def _extract_concepts_from_trace(self, reasoning_trace):
+        """Extract concept IDs involved in a reasoning trace"""
+        # This is a simplified implementation
+        # A real implementation would analyze the trace in depth
+
+        # For now, we'll just process the model's most recent thought state
+        concepts_involved = []
+
+        if hasattr(self.model, "thought_state") and self.model.thought_state.thought_memory:
+            # Get the current thought state
+            current_thought = self.model.thought_state.thought_memory[-1]
+
+            # Project to concept space
+            concept_projection = self.model.thought_state.project_to_concept_space(current_thought)
+
+            # Find similar concepts
+            concept_vector = concept_projection.detach().cpu().mean(dim=(0, 1))
+            similar_concepts = self.model.concept_bank.find_similar_concepts(concept_vector, top_k=10)
+
+            # Add to concepts involved with decreasing importance
+            for i, (concept_id, similarity) in enumerate(similar_concepts):
+                importance = (10 - i) / 10  # Decreasing importance: 1.0, 0.9, 0.8, ...
+                concepts_involved.append((concept_id, importance * similarity))
+
+        return concepts_involved
+
+
+class ReasoningEngine:
+    """Implements different reasoning strategies for solving tasks"""
+
+    def __init__(self, trainer):
+        """Initialize the reasoning engine with a reference to the trainer"""
+        self.trainer = trainer
+        self.model = trainer.model
+
+        # Reasoning strategies
+        self.reasoning_strategies = {
+            ReasoningType.DEDUCTION: self._deductive_reasoning,
+            ReasoningType.ABDUCTION: self._abductive_reasoning,
+            ReasoningType.INDUCTION: self._inductive_reasoning,
+            ReasoningType.TRIAL_ERROR: self._trial_error_reasoning
+        }
+
+        # Domain-specific reasoning preferences
+        self.domain_reasoning_preferences = {
+            TaskDomain.TEXT: [ReasoningType.DEDUCTION, ReasoningType.INDUCTION, ReasoningType.ABDUCTION, ReasoningType.TRIAL_ERROR],
+            TaskDomain.MATH: [ReasoningType.DEDUCTION, ReasoningType.TRIAL_ERROR, ReasoningType.INDUCTION, ReasoningType.ABDUCTION],
+            TaskDomain.CODE: [ReasoningType.DEDUCTION, ReasoningType.TRIAL_ERROR, ReasoningType.INDUCTION, ReasoningType.ABDUCTION],
+            TaskDomain.LOGIC: [ReasoningType.DEDUCTION, ReasoningType.ABDUCTION, ReasoningType.INDUCTION, ReasoningType.TRIAL_ERROR],
+            TaskDomain.CREATIVE: [ReasoningType.ABDUCTION, ReasoningType.INDUCTION, ReasoningType.TRIAL_ERROR, ReasoningType.DEDUCTION],
+            TaskDomain.MULTIMODAL: [ReasoningType.ABDUCTION, ReasoningType.INDUCTION, ReasoningType.DEDUCTION, ReasoningType.TRIAL_ERROR]
+        }
+
+        # Reasoning history
+        self.reasoning_history = []
+
+    def select_reasoning_type(self, domain, task):
+        """Select an appropriate reasoning type for a task"""
+        # Default preferences
+        preferences = self.domain_reasoning_preferences.get(
+            domain, [ReasoningType.DEDUCTION, ReasoningType.ABDUCTION, ReasoningType.INDUCTION, ReasoningType.TRIAL_ERROR]
+        )
+
+        # Check task keywords to adjust preferences
+        task_lower = task.lower()
+
+        # For tasks involving patterns or sequences
+        if any(kw in task_lower for kw in ["pattern", "sequence", "next", "series", "predict"]):
+            preferences = [ReasoningType.INDUCTION] + [p for p in preferences if p != ReasoningType.INDUCTION]
+
+        # For tasks involving figuring out unknown operations or rules
+        if any(kw in task_lower for kw in ["identify", "determine", "operation", "rule", "guess"]):
+            preferences = [ReasoningType.ABDUCTION] + [p for p in preferences if p != ReasoningType.ABDUCTION]
+
+        # For tasks involving clear logical steps
+        if any(kw in task_lower for kw in ["calculate", "solve", "find", "compute"]):
+            preferences = [ReasoningType.DEDUCTION] + [p for p in preferences if p != ReasoningType.DEDUCTION]
+
+        # For creative or generative tasks
+        if any(kw in task_lower for kw in ["create", "design", "invent", "imagine", "describe"]):
+            preferences = [ReasoningType.ABDUCTION, ReasoningType.INDUCTION] + [p for p in preferences if p not in [ReasoningType.ABDUCTION, ReasoningType.INDUCTION]]
+
+        # Occasionally use a random strategy for exploration (10% of the time)
+        if random.random() < 0.1:
+            return random.choice(list(self.reasoning_strategies.keys()))
+
+        # Return the top preference
+        return preferences[0]
+
+    def solve_task(self, task, task_context, reasoning_type):
+        """Solve a task using the specified reasoning type"""
+        # Get the appropriate reasoning strategy
+        reasoning_strategy = self.reasoning_strategies.get(
+            reasoning_type, self._deductive_reasoning
+        )
+
+        # Apply the reasoning strategy
+        solution, reasoning_trace = reasoning_strategy(task, task_context)
+
+        # Record reasoning history
+        self.reasoning_history.append({
+            "task": task,
+            "reasoning_type": reasoning_type,
+            "solution": solution,
+            "trace_length": len(reasoning_trace),
+            "timestamp": time.time()
+        })
+
+        return solution, reasoning_trace
+
+    def _deductive_reasoning(self, task, task_context):
+        """Apply deductive reasoning to solve a task (applying general rules to specific instances)"""
+        # Construct a detailed reasoning prompt
+        prompt = f"Task: {task}\n\nI will solve this step-by-step using deductive reasoning, applying general rules to this specific case:\n\n"
+
+        # Add context-specific reasoning structure
+        if "Calculate:" in task or "equation" in task:
+            prompt += "1. Let me identify the numbers and operations involved.\n"
+            prompt += "2. I will apply the relevant mathematical rules.\n"
+            prompt += "3. I will calculate the result systematically.\n\n"
+
+        elif "function" in task.lower() or "code" in task.lower():
+            prompt += "1. Let me analyze what functionality is required.\n"
+            prompt += "2. I will design a function that meets these requirements.\n"
+            prompt += "3. I will implement the function using proper syntax.\n"
+            prompt += "4. I will verify the function works as expected.\n\n"
+
+        elif "sequence" in task.lower() or "pattern" in task.lower():
+            prompt += "1. Let me examine the sequence to identify the pattern.\n"
+            prompt += "2. I will test whether it's an arithmetic, geometric, or other type of sequence.\n"
+            prompt += "3. I will apply the identified pattern to determine the next element(s).\n\n"
+
+        else:
+            prompt += "1. Let me break down the task into its components.\n"
+            prompt += "2. I will identify the relevant rules or principles that apply.\n"
+            prompt += "3. I will apply these rules systematically to reach a conclusion.\n\n"
+
+        prompt += "Now, let me work through this problem:\n"
+
+        # Generate the solution using the model
+        solution_text = self.model.generate(
+            input_text=prompt,
+            max_length=500,
+            temperature=0.7,
+            private_context=True
+        )
+
+        # Extract the reasoning trace and final solution
+        reasoning_trace = solution_text
+
+        # The final solution is typically at the end, after final reasoning
+        final_solution_markers = [
+            "Therefore, the answer is",
+            "The solution is",
+            "In conclusion,",
+            "Thus,",
+            "Final answer:",
+            "Result:"
+        ]
+
+        solution = solution_text
+        for marker in final_solution_markers:
+            if marker in solution_text:
+                solution = solution_text.split(marker, 1)[1].strip()
+                break
+
+        return solution, reasoning_trace
+
+    def _abductive_reasoning(self, task, task_context):
+        """Apply abductive reasoning to solve a task (inferring the most likely explanation)"""
+        # Construct a detailed reasoning prompt
+        prompt = f"Task: {task}\n\nI will solve this using abductive reasoning, finding the most likely explanation:\n\n"
+
+        # Add context-specific reasoning structure
+        if "identify" in task.lower() or "determine" in task.lower():
+            prompt += "1. Let me observe the given information carefully.\n"
+            prompt += "2. I will generate multiple hypotheses that could explain the observation.\n"
+            prompt += "3. I will evaluate each hypothesis based on simplicity and explanatory power.\n"
+            prompt += "4. I will select the most plausible explanation.\n\n"
+
+        elif "create" in task.lower() or "design" in task.lower():
+            prompt += "1. Let me understand the desired outcome or goal.\n"
+            prompt += "2. I will consider different approaches that could achieve this goal.\n"
+            prompt += "3. I will imagine the consequences of each approach.\n"
+            prompt += "4. I will select the approach most likely to succeed.\n\n"
+
+        else:
+            prompt += "1. Let me gather all the available clues and information.\n"
+            prompt += "2. I will formulate several possible explanations.\n"
+            prompt += "3. I will evaluate which explanation best fits the evidence.\n"
+            prompt += "4. I will choose the most likely explanation.\n\n"
+
+        prompt += "Let me explore multiple possibilities:\n"
+
+        # Generate the solution using the model
+        solution_text = self.model.generate(
+            input_text=prompt,
+            max_length=500,
+            temperature=0.8,  # Slightly higher temperature for more creative explanations
+            private_context=True
+        )
+
+        # Extract the reasoning trace and final solution
+        reasoning_trace = solution_text
+
+        # The final solution is typically at the end, after considering alternatives
+        final_solution_markers = [
+            "The most likely explanation is",
+            "Therefore, I conclude that",
+            "The best hypothesis is",
+            "The most plausible answer is",
+            "In conclusion,"
+        ]
+
+        solution = solution_text
+        for marker in final_solution_markers:
+            if marker in solution_text:
+                solution = solution_text.split(marker, 1)[1].strip()
+                break
+
+        return solution, reasoning_trace
+
+    def _inductive_reasoning(self, task, task_context):
+        """Apply inductive reasoning to solve a task (deriving general principles from specific instances)"""
+        # Construct a detailed reasoning prompt
+        prompt = f"Task: {task}\n\nI will solve this using inductive reasoning, identifying patterns to form a general rule:\n\n"
+
+        # Add context-specific reasoning structure
+        if "sequence" in task.lower() or "pattern" in task.lower():
+            prompt += "1. Let me examine the specific examples in the sequence.\n"
+            prompt += "2. I will look for recurring patterns or relationships.\n"
+            prompt += "3. I will formulate a general rule that describes the pattern.\n"
+            prompt += "4. I will apply this rule to predict the next elements.\n\n"
+
+        elif "categorize" in task.lower() or "classify" in task.lower():
+            prompt += "1. Let me examine the specific examples given.\n"
+            prompt += "2. I will identify common properties among similar examples.\n"
+            prompt += "3. I will formulate general categories based on these properties.\n"
+            prompt += "4. I will classify the examples according to these categories.\n\n"
+
+        else:
+            prompt += "1. Let me gather specific instances or examples related to the task.\n"
+            prompt += "2. I will observe patterns or commonalities among these instances.\n"
+            prompt += "3. I will formulate a general principle that explains these patterns.\n"
+            prompt += "4. I will apply this principle to solve the task.\n\n"
+
+        prompt += "Let me start by identifying patterns:\n"
+
+        # Generate the solution using the model
+        solution_text = self.model.generate(
+            input_text=prompt,
+            max_length=500,
+            temperature=0.7,
+            private_context=True
+        )
+
+        # Extract the reasoning trace and final solution
+        reasoning_trace = solution_text
+
+        # The final solution typically follows the pattern identification
+        final_solution_markers = [
+            "Based on this pattern,",
+            "The general rule is",
+            "Therefore, the answer is",
+            "Applying this principle,",
+            "In conclusion,"
+        ]
+
+        solution = solution_text
+        for marker in final_solution_markers:
+            if marker in solution_text:
+                solution = solution_text.split(marker, 1)[1].strip()
+                break
+
+        return solution, reasoning_trace
+
+    def _trial_error_reasoning(self, task, task_context):
+        """Apply trial and error reasoning to solve a task (testing multiple approaches)"""
+        # Construct a detailed reasoning prompt
+        prompt = f"Task: {task}\n\nI will solve this through trial and error, systematically testing different approaches:\n\n"
+
+        # Add context-specific reasoning structure
+        if "equation" in task.lower() or "solve" in task.lower():
+            prompt += "1. Let me try a few possible solutions and see which one works.\n"
+            prompt += "2. I will start with a reasonable guess and refine it.\n"
+            prompt += "3. I will test each potential solution against the constraints.\n"
+            prompt += "4. I will select the solution that satisfies all conditions.\n\n"
+
+        elif "code" in task.lower() or "function" in task.lower():
+            prompt += "1. Let me implement a basic solution and test it.\n"
+            prompt += "2. I will identify any errors or edge cases.\n"
+            prompt += "3. I will modify the solution to address these issues.\n"
+            prompt += "4. I will iterate until I have a working solution.\n\n"
+
+        else:
+            prompt += "1. Let me start with a plausible approach to the problem.\n"
+            prompt += "2. I will test this approach and evaluate its success.\n"
+            prompt += "3. I will adjust my approach based on the results.\n"
+            prompt += "4. I will continue iterating until I find a satisfactory solution.\n\n"
+
+        prompt += "Let me try different approaches:\n"
+
+        # Generate the solution using the model
+        solution_text = self.model.generate(
+            input_text=prompt,
+            max_length=600,  # Longer to allow for multiple trials
+            temperature=0.8,  # Higher temperature for more exploration
+            private_context=True
+        )
+
+        # Extract the reasoning trace and final solution
+        reasoning_trace = solution_text
+
+        # The final solution typically follows after several attempts
+        final_solution_markers = [
+            "After trying several approaches,",
+            "The approach that works is",
+            "The final solution is",
+            "Therefore, the answer is",
+            "This solution works because",
+            "In conclusion,"
+        ]
+
+        solution = solution_text
+        for marker in final_solution_markers:
+            if marker in solution_text:
+                solution = solution_text.split(marker, 1)[1].strip()
+                break
+
+        return solution, reasoning_trace
 
 def run_sam(config=None, load_path=None, hive_config=None, multimodal=False):
     """Create and run a SAM instance"""
