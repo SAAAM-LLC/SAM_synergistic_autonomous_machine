@@ -204,6 +204,13 @@ class ConceptMemoryBank(nn.Module):
             "multimodal": set()
         }
 
+        # Initialize with basic character concepts (a-z, A-Z, 0-9, etc.)
+        self._initialize_basic_concepts()
+
+        # Growth tracking
+        self.next_concept_id = len(self.source_to_concept)
+        self.creation_history = []
+
 
 ###########################################
 # MAIN SAM CLASS
@@ -2282,16 +2289,9 @@ class ExperienceManager:
     def get_modality_stats(self):
         """Get statistics about experiences by modality"""
         return {
-            modality: len(experiences) 
+            modality: len(experiences)
             for modality, experiences in self.modality_experiences.items()
         }
-
-        # Initialize with basic character concepts (a-z, A-Z, 0-9, etc.)
-        self._initialize_basic_concepts()
-
-        # Growth tracking
-        self.next_concept_id = len(self.source_to_concept)
-        self.creation_history = []
 
     def _initialize_basic_concepts(self):
         """Initialize basic character-level concepts"""
