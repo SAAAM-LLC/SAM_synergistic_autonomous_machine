@@ -204,12 +204,15 @@ class ConceptMemoryBank(nn.Module):
             "multimodal": set()
         }
 
+        # Growth tracking
+        self.next_concept_id = 0
+        self.creation_history = []
+
         # Initialize with basic character concepts (a-z, A-Z, 0-9, etc.)
         self._initialize_basic_concepts()
 
-        # Growth tracking
+        # Advance counter based on loaded concepts
         self.next_concept_id = len(self.source_to_concept)
-        self.creation_history = []
 
 
 ###########################################
@@ -6779,7 +6782,6 @@ class SolutionVerifier:
 
     def _extract_numeric_answer(self, text):
         """Extract a numeric answer from a text solution"""
-        import re
 
         # Try to find numbers in the text
         matches = re.findall(r'-?\d+\.?\d*', text)
