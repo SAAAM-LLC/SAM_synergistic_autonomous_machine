@@ -5201,14 +5201,18 @@ class SAMTrainer:
             # Initialize scheduler
             try:
                 from torch.optim.lr_scheduler import OneCycleLR
+                pct_start = self.warmup_steps / self.max_steps if self.max_steps > 0 else 0.1
+                pct_start = min(max(pct_start, 0.0), 1.0)
                 self.scheduler = OneCycleLR(
                     self.optimizer,
                     max_lr=self.learning_rate,
                     total_steps=self.max_steps,
-                    pct_start=self.warmup_steps / self.max_steps if self.max_steps > 0 else 0.1,
+                    pct_start=pct_start,
                     anneal_strategy='cos'
                 )
-                logger.info(f"Scheduler initialized: total_steps={self.max_steps}, warmup_steps={self.warmup_steps}, pct_start={self.warmup_steps/self.max_steps:.4f}")
+                logger.info(
+                    f"Scheduler initialized: total_steps={self.max_steps}, warmup_steps={self.warmup_steps}, pct_start={pct_start:.4f}"
+                )
             except Exception as e:
                 logger.error(f"Failed to initialize scheduler: {e}")
                 return None

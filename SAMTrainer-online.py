@@ -834,11 +834,13 @@ class AdvancedSAMTrainer:
         try:
             # Initialize scheduler
             total_steps = self.config.max_steps
+            pct_start = self.config.warmup_steps / total_steps if total_steps > 0 else 0.1
+            pct_start = min(max(pct_start, 0.0), 1.0)
             self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
                 self.optimizer,
                 max_lr=self.config.learning_rate,
                 total_steps=total_steps,
-                pct_start=self.config.warmup_steps / total_steps,
+                pct_start=pct_start,
                 anneal_strategy='cos'
             )
             
