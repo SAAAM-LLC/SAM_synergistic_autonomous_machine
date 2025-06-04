@@ -162,7 +162,7 @@ def run_training_mode(args):
 
         # Start training
         try:
-            logger.info(f"Starting training with:")
+            logger.info("Starting training with:")
             logger.info(f"  - Training data: {args.train_data}")
             logger.info(f"  - Evaluation data: {args.eval_data or 'None'}")
             logger.info(f"  - Batch size: {args.batch_size}")
@@ -175,7 +175,7 @@ def run_training_mode(args):
             
             if results:
                 logger.info("Training completed successfully!")
-                logger.info(f"Final results:")
+                logger.info("Final results:")
                 logger.info(f"  - Steps completed: {results['steps']}")
                 logger.info(f"  - Epochs completed: {results['epochs']}")
                 logger.info(f"  - Final loss: {results.get('final_loss', 'N/A')}")

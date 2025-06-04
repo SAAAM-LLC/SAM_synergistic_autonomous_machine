@@ -21,6 +21,7 @@ import base64
 import io
 import zlib
 import copy
+import re
 from typing import Dict, List, Optional, Tuple, Any, Union
 from dataclasses import dataclass, field, asdict
 from collections import defaultdict, Counter, deque
@@ -742,11 +743,11 @@ class SAM(nn.Module):
                     if current_dim < max_dim:
                         # Grow in width
                         self.grow()
-                        logger.info(f"Model evolved: capacity increased due to high utilization")
+                        logger.info("Model evolved: capacity increased due to high utilization")
                     elif len(self.layers) < self.config.max_num_layers:
                         # If can't grow wider, grow deeper
                         self.grow(new_hidden_dim=current_dim, num_new_layers=1)
-                        logger.info(f"Model evolved: added new layer due to high utilization")
+                        logger.info("Model evolved: added new layer due to high utilization")
 
         # Record evolution experience
         self.experience_manager.record_experience(
@@ -1845,7 +1846,7 @@ class HiveMindSynchronizer:
             await runner.setup()
             site = web.TCPSite(runner, '0.0.0.0', 8765)
             await site.start()
-            logger.info(f"Hive mind server running on port 8765")
+            logger.info("Hive mind server running on port 8765")
 
             while not self.stop_sync.is_set():
                 # Clean up stale instances
@@ -5123,11 +5124,11 @@ class SAMTrainer:
                 if loss.numel() > 1:
                     # Multiple elements - reduce to mean
                     loss = loss.mean()
-                    logger.debug(f"Reduced loss tensor to scalar via mean()")
+                    logger.debug("Reduced loss tensor to scalar via mean()")
                 else:
                     # Single element - squeeze dimensions
                     loss = loss.squeeze()
-                    logger.debug(f"Squeezed loss tensor dimensions")
+                    logger.debug("Squeezed loss tensor dimensions")
             
             # Validate the result
             if hasattr(loss, 'numel') and loss.numel() != 1:
@@ -7345,6 +7346,32 @@ class ReasoningEngine:
                 break
 
         return solution, reasoning_trace
+
+
+def create_sam_model(config_overrides=None, load_vocab=True, hive_mind=False, multimodal=False):
+    """Convenience function to create a SAM model with optional overrides."""
+    config = SAMConfig()
+    if config_overrides:
+        for key, value in config_overrides.items():
+            if hasattr(config, key):
+                setattr(config, key, value)
+
+    if hive_mind:
+        config.hive_enabled = True
+    if multimodal:
+        config.multimodal_enabled = True
+
+    config = config.validate()
+
+    model = SAM(config)
+
+    if load_vocab:
+        try:
+            model.load_claude_vocabulary()
+        except Exception as e:
+            logger.warning(f"Could not load default vocabulary: {e}")
+
+    return model, config
 
     def _abductive_reasoning(self, task, task_context):
         """Apply abductive reasoning to solve a task (inferring the most likely explanation)"""

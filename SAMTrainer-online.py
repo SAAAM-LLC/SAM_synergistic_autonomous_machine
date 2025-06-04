@@ -677,7 +677,7 @@ class WebKnowledgeProcessor:
 class DomainSpecialist:
     """Specialized knowledge processor for specific domains"""
     
-    def __init__(self, domain: str, config: RevolutionaryTrainingConfig):
+    def __init__(self, domain: str, config: AdvancedTrainingConfig):
         self.domain = domain
         self.config = config
         self.seed_urls = self._get_domain_seeds()
@@ -783,7 +783,7 @@ class DomainSpecialist:
             
         return await processor.crawl_and_process(self.seed_urls, target_concepts)
 
-class SAMTrainer:
+class AdvancedSAMTrainer:
     """Advanced SAM Trainer with Integrated Web Knowledge and Autonomous Capabilities"""
     
     def __init__(self, model, config: AdvancedTrainingConfig = None):
@@ -1549,7 +1549,7 @@ class BiasDetector:
 class PerformanceOptimizer:
     """Optimize training performance automatically"""
     
-    def __init__(self, trainer: SAMTrainer):
+    def __init__(self, trainer: AdvancedSAMTrainer):
         self.trainer = trainer
         self.optimization_history = []
         
@@ -1599,9 +1599,9 @@ class PerformanceOptimizer:
                 logger.info(f"Reduced learning rate to {param_group['lr']}")
 
 # Integration function
-def create_advanced_trainer(model, config: AdvancedTrainingConfig = None) -> SAMTrainer:
+def create_advanced_trainer(model, config: AdvancedTrainingConfig = None) -> AdvancedSAMTrainer:
     """Create an advanced SAM trainer with all enhanced features"""
-    trainer = SAMTrainer(model, config)
+    trainer = AdvancedSAMTrainer(model, config)
     
     # Add plug-and-play extensions
     if config and config.real_time_fact_checking:
