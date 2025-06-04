@@ -213,6 +213,357 @@ class ConceptMemoryBank(nn.Module):
 
         # Advance counter based on loaded concepts
         self.next_concept_id = len(self.source_to_concept)
+    def _initialize_basic_concepts(self):
+        """Initialize basic character-level concepts"""
+        # Add ASCII characters
+        for i in range(128):
+            char = chr(i)
+            self.add_character_concept(char)
+
+        # Add common character sequences for English
+        common_sequences = [
+            # Common words
+            "the", "and", "of", "to", "in", "is", "you", "that", "it", "he", "she", "was", "for",
+            "on", "are", "with", "as", "they", "be", "at", "this", "have", "from", "or", "by",
+            # Common word parts
+            "ing", "ed", "er", "ion", "ly", "tion", "ment", "ness", "able", "ible", "al", "ic",
+            # Programming tokens
+            "def", "class", "function", "if", "else", "for", "while", "return", "import",
+            "from", "try", "except", "True", "False", "None", "self", "print",
+            # Punctuation sequences
+            "...", "->", "=>", "!=", "==", ">=", "<=", "://", "///", "???", "!!!"
+        ]
+
+        for seq in common_sequences:
+            self.add_character_concept(seq)
+
+    def add_character_concept(self, char_sequence, hive_private=False, origin=None, global_id=None, modality="text"):
+        """Add a character sequence as a concept"""
+        if char_sequence in self.source_to_concept:
+            return self.source_to_concept[char_sequence]
+
+        concept_id = self.next_concept_id
+        self.source_to_concept[char_sequence] = concept_id
+
+        # Initialize metadata
+        self.concept_metadata[concept_id] = {
+            "source": char_sequence,
+            "type": "character_sequence",
+            "created_at": time.time(),
+            "frequency": 0,
+            "contexts": Counter(),
+            "hive_syncable": not hive_private,
+            "modality": modality
+        }
+
+        # Initialize embedding with character-based representation
+        with torch.no_grad():
+            # Simple character encoding
+            char_encoding = torch.zeros(self.concept_dim, dtype=torch.float, device=self.device)
+            for i, c in enumerate(char_sequence):
+                # Use ASCII value to influence embedding
+                char_val = ord(c) / 128.0  # Normalize
+                pos = (i % (self.concept_dim // 4)) * 4
+                char_encoding[pos:pos+4] += torch.tensor(
+                    [math.sin(char_val), math.cos(char_val),
+                     math.sin(2*char_val), math.cos(2*char_val)],
+                    device=self.device
+                )
+
+            # Normalize and set embedding
+            char_encoding = F.normalize(char_encoding, dim=0)
+            self.concept_embeddings.weight[concept_id] = char_encoding
+
+            # Initialize meaning vector
+            self.meaning_vectors[concept_id] = char_encoding
+
+        # Track hive mind status
+        if hive_private:
+            self.hive_private_concepts.add(concept_id)
+        else:
+            self.hive_shared_concepts.add(concept_id)
+            self.hive_pending_sync.add(concept_id)
+
+        # Track origin if provided
+        if origin:
+            self.hive_origin[concept_id] = origin
+
+        # Map to global ID if provided
+        if global_id:
+            self.hive_global_id_map[concept_id] = global_id
+
+        # Track modality
+        self.modality_concepts[modality].add(concept_id)
+
+        self.next_concept_id += 1
+        self.creation_history.append({
+            "concept_id": concept_id,
+            "source": char_sequence,
+            "timestamp": time.time(),
+            "modality": modality
+        })
+
+        return concept_id
+
+    def add_semantic_concept(self, meaning_vector, related_sources=None, metadata=None,
+                            hive_private=False, origin=None, global_id=None, modality="text"):
+        """Add a new semantic concept (not directly mapped to characters)"""
+        concept_id = self.next_concept_id
+
+        # Register meaning
+        with torch.no_grad():
+            self.meaning_vectors[concept_id] = F.normalize(meaning_vector, dim=0)
+            self.concept_embeddings.weight[concept_id] = meaning_vector
+
+        # Create metadata
+        meta = {
+            "type": "semantic",
+            "created_at": time.time(),
+            "frequency": 0,
+            "related_sources": related_sources or [],
+            "contexts": Counter(),
+            "hive_syncable": not hive_private,
+            "modality": modality
+        }
+
+        # Add custom metadata if provided
+        if metadata:
+            meta.update(metadata)
+
+        self.concept_metadata[concept_id] = meta
+
+        # Track hive mind status
+        if hive_private:
+            self.hive_private_concepts.add(concept_id)
+        else:
+            self.hive_shared_concepts.add(concept_id)
+            self.hive_pending_sync.add(concept_id)
+
+        # Track origin if provided
+        if origin:
+            self.hive_origin[concept_id] = origin
+
+        # Map to global ID if provided
+        if global_id:
+            self.hive_global_id_map[concept_id] = global_id
+
+        # Track modality
+        self.modality_concepts[modality].add(concept_id)
+
+        # Update tracking
+        self.next_concept_id += 1
+        self.creation_history.append({
+            "concept_id": concept_id,
+            "type": "semantic",
+            "timestamp": time.time(),
+            "modality": modality
+        })
+
+        return concept_id
+
+    def add_multimodal_concept(self, embeddings_dict, related_sources=None, metadata=None, hive_private=True):
+        """Add a concept that spans multiple modalities"""
+        # Create a merged embedding from all modalities
+        modalities = list(embeddings_dict.keys())
+        embeddings = list(embeddings_dict.values())
+        
+        # Simple average of all embeddings
+        combined = sum(embeddings) / len(embeddings)
+        combined = F.normalize(combined, dim=0)
+        
+        # Create specific metadata for multimodal concept
+        meta = metadata or {}
+        meta.update({
+            "modalities": modalities,
+            "modality": "multimodal"
+        })
+        
+        # Add the concept
+        concept_id = self.add_semantic_concept(
+            meaning_vector=combined,
+            related_sources=related_sources,
+            metadata=meta,
+            hive_private=hive_private,
+            modality="multimodal"
+        )
+        
+        return concept_id
+
+    def forward(self, concept_ids):
+        """Get embeddings for concept IDs"""
+        if isinstance(concept_ids, list):
+            # Handle nested lists (from segmentation)
+            flat_ids = []
+            for item in concept_ids:
+                if isinstance(item, list):
+                    flat_ids.extend(item)
+                else:
+                    flat_ids.append(item)
+            concept_ids = torch.tensor(flat_ids, device=self.device)
+
+        return self.concept_embeddings(concept_ids)
+
+    def update_concept_usage(self, concept_id, context=None, register_for_sync=True):
+        """Update usage statistics for a concept"""
+        if concept_id >= len(self.concept_frequencies):
+            # Resize tracking tensors if needed
+            new_size = concept_id + 1
+            old_size = len(self.concept_frequencies)
+
+            # Create new tensors
+            new_freqs = torch.zeros(new_size - old_size, dtype=torch.int, device=self.device)
+            new_timestamps = torch.zeros(new_size - old_size, dtype=torch.float, device=self.device)
+
+            # Concatenate with existing tensors
+            self.concept_frequencies = torch.cat([self.concept_frequencies, new_freqs])
+            self.concept_timestamps = torch.cat([self.concept_timestamps, new_timestamps])
+
+        # Update frequency and timestamp
+        self.concept_frequencies[concept_id] += 1
+        self.concept_timestamps[concept_id] = time.time()
+
+        # Update context tracking
+        if context and concept_id in self.concept_metadata:
+            context_str = str(context)[:100]  # Limit context length
+            self.concept_metadata[concept_id]["contexts"][context_str] += 1
+            self.concept_metadata[concept_id]["frequency"] = self.concept_frequencies[concept_id].item()
+
+        # Register for hive mind sync if applicable
+        if register_for_sync and concept_id not in self.hive_private_concepts:
+            self.hive_pending_sync.add(concept_id)
+
+    def create_merged_concept(self, concept_id1, concept_id2, frequency=None, hive_private=False):
+        """Create a new concept by merging two existing concepts"""
+        # Get source sequences if available
+        source1 = self.concept_metadata.get(concept_id1, {}).get("source", "")
+        source2 = self.concept_metadata.get(concept_id2, {}).get("source", "")
+
+        merged_source = source1 + source2 if source1 and source2 else None
+
+        # Create merged meaning vector
+        meaning1 = self.meaning_vectors[concept_id1]
+        meaning2 = self.meaning_vectors[concept_id2]
+        merged_meaning = (meaning1 + meaning2) / 2
+
+        # Check if either parent concept is private
+        either_private = (concept_id1 in self.hive_private_concepts or
+                         concept_id2 in self.hive_private_concepts)
+        is_private = hive_private or either_private
+
+        # Check modalities
+        modality1 = self.concept_metadata.get(concept_id1, {}).get("modality", "text")
+        modality2 = self.concept_metadata.get(concept_id2, {}).get("modality", "text")
+        
+        # If merging across modalities, mark as multimodal
+        if modality1 != modality2:
+            merged_modality = "multimodal"
+        else:
+            merged_modality = modality1
+
+        # Register the merged concept
+        merged_id = self.add_semantic_concept(
+            meaning_vector=merged_meaning,
+            related_sources=[source1, source2] if source1 and source2 else None,
+            metadata={
+                "type": "merged",
+                "parent_concepts": [concept_id1, concept_id2],
+                "frequency": frequency or 1,
+                "modality": merged_modality
+            },
+            hive_private=is_private,
+            modality=merged_modality
+        )
+
+        # Register source mapping if available
+        if merged_source:
+            self.source_to_concept[merged_source] = merged_id
+
+        # Link as related concepts
+        self.related_concepts[concept_id1].append(merged_id)
+        self.related_concepts[concept_id2].append(merged_id)
+
+        return merged_id
+
+    def find_concept_by_source(self, char_sequence):
+        """Find concept ID for a character sequence"""
+        return self.source_to_concept.get(char_sequence, None)
+
+    def find_similar_concepts(self, query_vector, top_k=5, modality=None):
+        """Find concepts with similar meaning vectors"""
+        # Normalize query
+        query_vector = F.normalize(query_vector, dim=0)
+
+        # Get the filter for specific modality if requested
+        concept_filter = None
+        if modality is not None:
+            concept_filter = list(self.modality_concepts.get(modality, set()))
+            if not concept_filter:  # If no concepts in this modality
+                return []
+
+        # Compute similarities
+        if concept_filter:
+            # Only compare with concepts of the requested modality
+            filtered_vectors = self.meaning_vectors[concept_filter]
+            similarities = F.cosine_similarity(
+                query_vector.unsqueeze(0),
+                filtered_vectors,
+                dim=1
+            )
+            values, indices = torch.topk(similarities, min(top_k, len(similarities)))
+            return [(concept_filter[idx.item()], val.item()) for idx, val in zip(indices, values)]
+        else:
+            # Compare with all concepts
+            similarities = F.cosine_similarity(
+                query_vector.unsqueeze(0),
+                self.meaning_vectors[:self.next_concept_id],
+                dim=1
+            )
+            values, indices = torch.topk(similarities, min(top_k, len(similarities)))
+            return [(idx.item(), val.item()) for idx, val in zip(indices, values)]
+
+    def grow_if_needed(self):
+        """Grow concept bank if approaching capacity"""
+        if self.next_concept_id > len(self.concept_embeddings.weight) - self.growth_rate:
+            logger.info(f"Growing concept bank from {len(self.concept_embeddings.weight)} to {len(self.concept_embeddings.weight) + self.growth_rate}")
+
+            old_embedding = self.concept_embeddings
+            self.concept_embeddings = nn.Embedding(
+                len(old_embedding.weight) + self.growth_rate,
+                self.concept_dim
+            ).to(self.device)
+
+            # Copy existing embeddings
+            with torch.no_grad():
+                self.concept_embeddings.weight[:len(old_embedding.weight)] = old_embedding.weight
+
+            # Grow meaning vectors
+            new_meaning_vectors = torch.zeros(
+                len(old_embedding.weight) + self.growth_rate,
+                self.concept_dim,
+                device=self.device
+            )
+            new_meaning_vectors[:len(self.meaning_vectors)] = self.meaning_vectors
+            self.register_buffer("meaning_vectors", new_meaning_vectors)
+
+            # Grow tracking tensors
+            new_freqs = torch.zeros(
+                len(old_embedding.weight) + self.growth_rate,
+                dtype=torch.int,
+                device=self.device
+            )
+            new_freqs[:len(self.concept_frequencies)] = self.concept_frequencies
+            self.register_buffer("concept_frequencies", new_freqs)
+
+            new_timestamps = torch.zeros(
+                len(old_embedding.weight) + self.growth_rate,
+                dtype=torch.float,
+                device=self.device
+            )
+            new_timestamps[:len(self.concept_timestamps)] = self.concept_timestamps
+            self.register_buffer("concept_timestamps", new_timestamps)
+
+            return True
+
 
 
 ###########################################
