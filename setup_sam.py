@@ -160,7 +160,7 @@ def create_initial_config():
 
 def main():
     parser = argparse.ArgumentParser(description='Set up SAM training environment')
-    parser.add_argument('--data_dir', type=str, default='./input_data', 
+    parser.add_argument('--data_dir', type=str, default='./data/raw',
                       help='Directory containing raw data files')
     args = parser.parse_args()
     
