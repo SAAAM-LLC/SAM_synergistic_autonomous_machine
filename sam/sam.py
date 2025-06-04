@@ -786,7 +786,7 @@ class SAM(nn.Module):
         # Apply thought state processing if enabled
         if use_thought_state:
             # Update thought state with current concepts
-            thought_context = self.thought_state.update(
+            self.thought_state.update(
                 concept_embeds,
                 use_hive_mind=use_hive_mind and self.config.hive_enabled,
                 modality=self.current_modality
@@ -3139,8 +3139,6 @@ class ConceptualDreaming:
                     is_multimodal = modality1 != modality2
                     
                     # Merge concepts
-                    merged_modality = "multimodal" if is_multimodal else modality1
-                    
                     self.model.concept_bank.create_merged_concept(
                         concept_id1, concept_id2,
                         frequency=min(freq1, freq2),
@@ -3236,8 +3234,8 @@ class ConceptualDreaming:
         if self.model.concept_bank.next_concept_id < 200:
             return
 
-        # Get concept usage statistics
-        concept_stats = self.model.concept_bank.get_concept_stats()
+        # Get concept usage statistics (unused return value)
+        self.model.concept_bank.get_concept_stats()
 
         # Find least used semantic concepts (not character concepts)
         semantic_concepts = []
@@ -3324,8 +3322,9 @@ class ConceptualDreaming:
                         concept_id1, concept_id2,
                         hive_private=True
                     )
-                    
+
                     created_count += 1
+                    logger.debug(f"Cross-modal merge created concept {merged_id}")
                     
                     # Record synthesis
                     source1 = self.model.concept_bank.concept_metadata.get(concept_id1, {}).get("source", "")

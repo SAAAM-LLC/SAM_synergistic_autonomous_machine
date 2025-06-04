@@ -1270,6 +1270,7 @@ class AdvancedSAMTrainer:
                                     modality=concept_data.get('type', 'text')
                                 )
                                 concepts_added += 1
+                                logger.debug(f"Added concept {concept_id} from web knowledge")
                                 
                 # Add content as experience
                 if hasattr(self.model, 'experience_manager'):
