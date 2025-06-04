@@ -7704,30 +7704,6 @@ class ReasoningEngine:
         return solution, reasoning_trace
 
 
-def create_sam_model(config_overrides=None, load_vocab=True, hive_mind=False, multimodal=False):
-    """Convenience function to create a SAM model with optional overrides."""
-    config = SAMConfig()
-    if config_overrides:
-        for key, value in config_overrides.items():
-            if hasattr(config, key):
-                setattr(config, key, value)
-
-    if hive_mind:
-        config.hive_enabled = True
-    if multimodal:
-        config.multimodal_enabled = True
-
-    config = config.validate()
-
-    model = SAM(config)
-
-    if load_vocab:
-        try:
-            model.load_claude_vocabulary()
-        except Exception as e:
-            logger.warning(f"Could not load default vocabulary: {e}")
-
-    return model, config
 
     def _abductive_reasoning(self, task, task_context):
         """Apply abductive reasoning to solve a task (inferring the most likely explanation)"""
@@ -7891,6 +7867,31 @@ def create_sam_model(config_overrides=None, load_vocab=True, hive_mind=False, mu
                 break
 
         return solution, reasoning_trace
+
+def create_sam_model(config_overrides=None, load_vocab=True, hive_mind=False, multimodal=False):
+    """Convenience function to create a SAM model with optional overrides."""
+    config = SAMConfig()
+    if config_overrides:
+        for key, value in config_overrides.items():
+            if hasattr(config, key):
+                setattr(config, key, value)
+
+    if hive_mind:
+        config.hive_enabled = True
+    if multimodal:
+        config.multimodal_enabled = True
+
+    config = config.validate()
+
+    model = SAM(config)
+
+    if load_vocab:
+        try:
+            model.load_claude_vocabulary()
+        except Exception as e:
+            logger.warning(f"Could not load default vocabulary: {e}")
+
+    return model, config
 
 def run_sam(config=None, load_path=None, hive_config=None, multimodal=False):
     """Create and run a SAM instance"""
