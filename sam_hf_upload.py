@@ -1369,7 +1369,7 @@ if __name__ == "__main__":
         return_dict=True
     )
     
-    print(f"Forward pass successful!")
+    print("Forward pass successful!")
     print(f"  Logits shape: {outputs.logits.shape}")
     print(f"  Consciousness level: {outputs.consciousness_level.mean().item():.4f}")
     print(f"  Evolution metrics available: {outputs.evolution_metrics is not None}")
