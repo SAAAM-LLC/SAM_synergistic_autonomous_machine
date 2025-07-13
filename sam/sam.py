@@ -12404,6 +12404,901 @@ class KnowledgeAcquisition:
 
 
 ###########################################
+# TRAINING AND RUNTIME
+###########################################
+import logging
+# Get logger
+logger = logging.getLogger("SAM")
+
+class SAMTrainer:
+    """Training manager for the SAM model - Production Ready with Full Error Handling"""
+
+    def __init__(
+        self,
+        model,  # SAM model instance
+        train_data_path=None,
+        eval_data_path=None,
+        batch_size=16,
+        learning_rate=None,
+        warmup_steps=None,
+        max_steps=None,
+        num_epochs=3,
+        multimodal_train=False,
+        gradient_clip_val=1.0,
+        save_every_n_steps=1000,
+        eval_every_n_steps=1000,
+        log_every_n_steps=100
+    ):
+        self.model = model
+        self.train_data_path = train_data_path
+        self.eval_data_path = eval_data_path
+        self.batch_size = batch_size
+        self.learning_rate = learning_rate or model.config.learning_rate
+        self.warmup_steps = warmup_steps or model.config.warmup_steps
+        self.max_steps = max_steps
+        self.num_epochs = num_epochs
+        self.multimodal_train = multimodal_train
+        self.gradient_clip_val = gradient_clip_val
+        self.save_every_n_steps = save_every_n_steps
+        self.eval_every_n_steps = eval_every_n_steps
+        self.log_every_n_steps = log_every_n_steps
+
+        # Initialize optimizer with proper error handling
+        try:
+            self.optimizer = torch.optim.AdamW(
+                model.parameters(),
+                lr=self.learning_rate,
+                betas=(0.9, 0.999),
+                eps=1e-8,
+                weight_decay=0.01
+            )
+            logger.info(f"Optimizer initialized with lr={self.learning_rate}")
+        except Exception as e:
+            logger.error(f"Failed to initialize optimizer: {e}")
+            raise
+
+        # Initialize scheduler later when we know total_steps
+        self.scheduler = None
+
+        # Track best model
+        self.best_loss = float('inf')
+        self.best_step = 0
+
+        # Training statistics
+        self.training_stats = {
+            "total_steps": 0,
+            "total_samples": 0,
+            "loss_history": [],
+            "lr_history": [],
+            "start_time": None,
+            "current_epoch": 0
+        }
+
+        logger.info(f"SAMTrainer initialized - Device: {model.config.device}, Batch Size: {batch_size}")
+
+    def _ensure_scalar_loss(self, loss):
+        """CRITICAL FIX: Ensure loss is always a scalar tensor"""
+        if loss is None:
+            return None
+
+        try:
+            # Handle different loss tensor shapes
+            if hasattr(loss, 'ndim') and loss.ndim > 0:
+                if loss.numel() > 1:
+                    # Multiple elements - reduce to mean
+                    loss = loss.mean()
+                    logger.debug(f"Reduced loss tensor to scalar via mean()")
+                else:
+                    # Single element - squeeze dimensions
+                    loss = loss.squeeze()
+                    logger.debug(f"Squeezed loss tensor dimensions")
+
+            # Validate the result
+            if hasattr(loss, 'numel') and loss.numel() != 1:
+                logger.warning(f"Loss still not scalar after processing: {loss.numel()} elements")
+                loss = loss.mean()  # Final fallback
+
+            # Check for NaN or infinite values
+            if torch.isnan(loss) or torch.isinf(loss):
+                logger.warning(f"Invalid loss value detected: {loss}")
+                return None
+
+            return loss
+
+        except Exception as e:
+            logger.error(f"Error processing loss tensor: {e}")
+            return None
+
+    def _validate_batch_data(self, batch):
+        """Validate batch data before processing"""
+        try:
+            if not batch:
+                logger.warning("Empty batch received")
+                return False
+
+            # Check for required fields
+            for i, sample in enumerate(batch):
+                if not isinstance(sample, dict):
+                    logger.warning(f"Sample {i} is not a dictionary: {type(sample)}")
+                    return False
+
+                if "text" not in sample:
+                    logger.warning(f"Sample {i} missing 'text' field")
+                    return False
+
+                if not isinstance(sample["text"], str) or len(sample["text"]) == 0:
+                    logger.warning(f"Sample {i} has invalid text: {sample['text']}")
+                    return False
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Error validating batch: {e}")
+            return False
+
+    def train(self):
+        """Train the model with comprehensive error handling"""
+        if not self.train_data_path:
+            logger.error("No training data provided")
+            return None
+
+        try:
+            # Load and validate training data
+            logger.info("Loading training data...")
+            train_data = self._load_data(self.train_data_path)
+
+            if not train_data:
+                logger.error("No training data loaded successfully")
+                return None
+
+            logger.info(f"Loaded {len(train_data)} training samples")
+
+            # Calculate total steps
+            if not self.max_steps:
+                self.max_steps = (len(train_data) // self.batch_size) * self.num_epochs
+
+            if self.max_steps <= 0:
+                logger.error(f"Invalid max_steps calculated: {self.max_steps}")
+                return None
+
+            # Initialize scheduler
+            try:
+                from torch.optim.lr_scheduler import OneCycleLR
+                self.scheduler = OneCycleLR(
+                    self.optimizer,
+                    max_lr=self.learning_rate,
+                    total_steps=self.max_steps,
+                    pct_start=self.warmup_steps / self.max_steps if self.max_steps > 0 else 0.1,
+                    anneal_strategy='cos'
+                )
+                logger.info(f"Scheduler initialized: total_steps={self.max_steps}, warmup_steps={self.warmup_steps}, pct_start={self.warmup_steps/self.max_steps:.4f}")
+            except Exception as e:
+                logger.error(f"Failed to initialize scheduler: {e}")
+                return None
+
+            # Disable hive mind and dreaming during training
+            old_hive_enabled = getattr(self.model.config, 'hive_enabled', False)
+            if hasattr(self.model.config, 'hive_enabled'):
+                self.model.config.hive_enabled = False
+
+            # Stop background services safely
+            try:
+                if hasattr(self.model, 'stop_services'):
+                    self.model.stop_services()
+            except Exception as e:
+                logger.warning(f"Error stopping background services: {e}")
+
+            # Initialize training statistics
+            self.training_stats["start_time"] = time.time()
+
+            logger.info(f"Starting training for {self.max_steps} steps across {self.num_epochs} epochs")
+
+            try:
+                return self._training_loop(train_data)
+
+            finally:
+                # Restore hive mind setting
+                if hasattr(self.model.config, 'hive_enabled'):
+                    self.model.config.hive_enabled = old_hive_enabled
+
+                # Restart background services safely
+                try:
+                    if hasattr(self.model, 'start_services') and old_hive_enabled:
+                        self.model.start_services()
+                except Exception as e:
+                    logger.warning(f"Error restarting background services: {e}")
+
+        except Exception as e:
+            logger.error(f"Training failed with error: {e}", exc_info=True)
+            return None
+
+    def _training_loop(self, train_data):
+        """Main training loop with robust error handling"""
+        step = 0
+        epoch = 0
+
+        while step < self.max_steps and epoch < self.num_epochs:
+            try:
+                self.model.train()
+                epoch_loss = 0.0
+                epoch_samples = 0
+                valid_batches = 0
+
+                self.training_stats["current_epoch"] = epoch + 1
+
+                # Create batches with shuffling
+                try:
+                    random.shuffle(train_data)
+                    batches = [
+                        train_data[i:i + self.batch_size]
+                        for i in range(0, len(train_data), self.batch_size)
+                    ]
+                    logger.info(f"Epoch {epoch + 1}: Created {len(batches)} batches")
+                except Exception as e:
+                    logger.error(f"Error creating batches: {e}")
+                    break
+
+                for batch_idx, batch in enumerate(batches):
+                    try:
+                        # Validate batch
+                        if not self._validate_batch_data(batch):
+                            logger.warning(f"Skipping invalid batch {batch_idx}")
+                            continue
+
+                        # Process batch
+                        batch_loss = self._process_batch(batch, step)
+
+                        if batch_loss is not None:
+                            epoch_loss += batch_loss
+                            valid_batches += 1
+                            epoch_samples += len(batch)
+
+                            # Update training statistics
+                            self.training_stats["loss_history"].append(batch_loss)
+                            if self.scheduler:
+                                self.training_stats["lr_history"].append(self.scheduler.get_last_lr()[0])
+
+                        step += 1
+                        self.training_stats["total_steps"] = step
+
+                        # Logging
+                        if step % self.log_every_n_steps == 0 and valid_batches > 0:
+                            avg_loss = epoch_loss / valid_batches
+                            current_lr = self.scheduler.get_last_lr()[0] if self.scheduler else self.learning_rate
+                            logger.info(f"Step {step}/{self.max_steps} | Epoch {epoch + 1} | Loss: {avg_loss:.6f} | LR: {current_lr:.2e} | Samples: {epoch_samples}")
+
+                        # Save checkpoint
+                        if step % self.save_every_n_steps == 0:
+                            try:
+                                checkpoint_path = os.path.join(self.model.config.save_dir, f"checkpoint-{step}")
+                                self.model.save(checkpoint_path)
+                                logger.info(f"Checkpoint saved at step {step}")
+                            except Exception as e:
+                                logger.error(f"Failed to save checkpoint: {e}")
+
+                        # Evaluation
+                        if step % self.eval_every_n_steps == 0 and self.eval_data_path:
+                            try:
+                                eval_loss = self.evaluate()
+                                if eval_loss is not None and eval_loss < self.best_loss:
+                                    self.best_loss = eval_loss
+                                    self.best_step = step
+                                    try:
+                                        best_path = os.path.join(self.model.config.save_dir, "best")
+                                        self.model.save(best_path)
+                                        logger.info(f"New best model saved with loss: {eval_loss:.6f}")
+                                    except Exception as e:
+                                        logger.error(f"Failed to save best model: {e}")
+                            except Exception as e:
+                                logger.error(f"Evaluation failed: {e}")
+
+                        if step >= self.max_steps:
+                            break
+
+                    except Exception as e:
+                        logger.error(f"Error processing batch {batch_idx}: {e}")
+                        continue
+
+                # End of epoch summary
+                epoch += 1
+                if valid_batches > 0:
+                    avg_epoch_loss = epoch_loss / valid_batches
+                    logger.info(f"Epoch {epoch} completed | Average Loss: {avg_epoch_loss:.6f} | Valid Batches: {valid_batches}/{len(batches)} | Samples: {epoch_samples}")
+                else:
+                    logger.warning(f"Epoch {epoch} completed with no valid batches")
+
+            except Exception as e:
+                logger.error(f"Error in epoch {epoch}: {e}")
+                break
+
+        # Save final model
+        try:
+            final_path = os.path.join(self.model.config.save_dir, "final")
+            self.model.save(final_path)
+            logger.info(f"Training completed. Final model saved to {final_path}")
+        except Exception as e:
+            logger.error(f"Failed to save final model: {e}")
+
+        # Calculate training duration
+        training_duration = time.time() - self.training_stats["start_time"]
+        self.training_stats["total_samples"] = sum(len(batch) for batch in train_data[:step])
+
+        return {
+            "steps": step,
+            "epochs": epoch,
+            "final_loss": avg_epoch_loss if 'avg_epoch_loss' in locals() else None,
+            "best_loss": self.best_loss,
+            "best_step": self.best_step,
+            "training_duration": training_duration,
+            "stats": self.training_stats
+        }
+
+    def _process_batch(self, batch, step):
+        """Process a single batch with comprehensive error handling and Titan X optimization"""
+        try:
+            # Extract text sequences
+            char_sequences = [sample["text"] for sample in batch]
+
+            # Handle multimodal data if enabled
+            image_data = None
+            audio_data = None
+            modality = "text"
+
+            if self.multimodal_train and getattr(self.model.config, 'multimodal_enabled', False):
+                try:
+                    # Process image data
+                    if any("image" in sample for sample in batch):
+                        image_batch = [sample.get("image") for sample in batch]
+                        if any(img is not None for img in image_batch):
+                            image_data = torch.stack([
+                                torch.tensor(img, device=self.model.config.device, dtype=self.model.config.dtype)
+                                if img is not None else torch.zeros(self.model.config.image_dim, device=self.model.config.device, dtype=self.model.config.dtype)
+                                for img in image_batch
+                            ])
+                            modality = "image"
+
+                    # Process audio data
+                    if any("audio" in sample for sample in batch):
+                        audio_batch = [sample.get("audio") for sample in batch]
+                        if any(aud is not None for aud in audio_batch):
+                            audio_data = torch.stack([
+                                torch.tensor(aud, device=self.model.config.device, dtype=self.model.config.dtype)
+                                if aud is not None else torch.zeros(self.model.config.audio_dim, device=self.model.config.device, dtype=self.model.config.dtype)
+                                for aud in audio_batch
+                            ])
+                            modality = "audio" if image_data is None else "multimodal"
+                except Exception as e:
+                    logger.warning(f"Error processing multimodal data: {e}")
+                    # Continue with text-only processing
+
+            # FIXED: Process each text sequence to concept IDs individually
+            try:
+                all_concept_sequences = []
+                max_seq_len = 0
+
+                for text in char_sequences:
+                    # Process text to concepts using the model's segmentation
+                    concept_ids, _ = self.model.process_text(text, modality=modality)
+
+                    # Ensure we have a list of concept IDs
+                    if not isinstance(concept_ids, list):
+                        concept_ids = [concept_ids] if concept_ids is not None else []
+
+                    # Limit sequence length for Titan X Pascal memory
+                    max_allowed_len = min(512, self.model.config.max_position_embeddings - 10)
+                    if len(concept_ids) > max_allowed_len:
+                        concept_ids = concept_ids[:max_allowed_len]
+
+                    all_concept_sequences.append(concept_ids)
+                    max_seq_len = max(max_seq_len, len(concept_ids))
+
+                # Pad all sequences to the same length
+                device = self.model.config.device
+                padded_sequences = []
+
+                for concept_seq in all_concept_sequences:
+                    # Pad sequence to max length
+                    padding_needed = max_seq_len - len(concept_seq)
+                    if padding_needed > 0:
+                        padded_seq = concept_seq + [0] * padding_needed
+                    else:
+                        padded_seq = concept_seq
+                    padded_sequences.append(padded_seq)
+
+                # Convert to tensor
+                concept_tensor = torch.tensor(padded_sequences, dtype=torch.long, device=device)
+
+                # Create attention mask
+                attention_mask = torch.zeros(concept_tensor.shape, dtype=torch.float, device=device)
+                for i, original_seq in enumerate(all_concept_sequences):
+                    attention_mask[i, :len(original_seq)] = 1.0
+
+            except Exception as e:
+                logger.error(f"Error converting text to concept IDs: {e}")
+                return None
+
+            # FIXED: Use the same tensor for both input and target
+            input_concepts = concept_tensor
+            target_concepts = concept_tensor.clone()  # Use clone to avoid in-place modification issues
+
+            # Forward pass with proper tensor shapes
+            try:
+                # Ensure model is in training mode
+                self.model.train()
+
+                # Forward pass - using concept_mask instead of separate target
+                outputs = self.model(
+                    input_concepts=input_concepts,
+                    concept_mask=attention_mask,
+                    target_concepts=target_concepts,
+                    return_dict=True,
+                    modality=modality,
+                    image_data=image_data,
+                    audio_data=audio_data
+                )
+
+                loss = outputs.get("loss")
+
+                # CRITICAL FIX: Ensure loss is scalar
+                loss = self._ensure_scalar_loss(loss)
+
+                if loss is None:
+                    logger.warning("Loss is None after forward pass")
+                    return None
+
+            except Exception as e:
+                logger.error(f"Error in forward pass: {e}")
+                return None
+
+            # Backward pass
+            try:
+                self.optimizer.zero_grad()
+
+                # Check for valid loss before backward
+                if torch.isnan(loss) or torch.isinf(loss):
+                    logger.warning(f"Invalid loss detected: {loss}")
+                    return None
+
+                loss.backward()
+
+                # Gradient clipping for Titan X Pascal stability
+                if self.gradient_clip_val > 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip_val)
+
+                # Check for NaN gradients
+                has_nan_grad = False
+                for name, param in self.model.named_parameters():
+                    if param.grad is not None and torch.isnan(param.grad).any():
+                        logger.warning(f"NaN gradient detected in {name}")
+                        has_nan_grad = True
+                        break
+
+                if has_nan_grad:
+                    return None
+
+                self.optimizer.step()
+
+                # Update learning rate
+                if self.scheduler:
+                    self.scheduler.step()
+
+            except Exception as e:
+                logger.error(f"Error in backward pass: {e}")
+                return None
+
+            # Return scalar loss value
+            try:
+                return loss.item()
+            except Exception as e:
+                logger.error(f"Error extracting loss value: {e}")
+                return None
+
+        except Exception as e:
+            logger.error(f"Error processing batch: {e}")
+            return None
+
+    def evaluate(self):
+        """Evaluate the model with robust error handling"""
+        if not self.eval_data_path:
+            logger.warning("No evaluation data path provided")
+            return None
+
+        try:
+            # Load evaluation data
+            eval_data = self._load_data(self.eval_data_path)
+            if not eval_data:
+                logger.warning("No evaluation data loaded")
+                return None
+
+            logger.info(f"Starting evaluation on {len(eval_data)} samples")
+
+            # Set model to eval mode
+            self.model.eval()
+            total_loss = 0.0
+            total_samples = 0
+            valid_batches = 0
+
+            # Create batches
+            batches = [
+                eval_data[i:i + self.batch_size]
+                for i in range(0, len(eval_data), self.batch_size)
+            ]
+
+            with torch.no_grad():
+                for batch_idx, batch in enumerate(batches):
+                    try:
+                        # Validate batch
+                        if not self._validate_batch_data(batch):
+                            continue
+
+                        # Process batch (similar to training but without backward pass)
+                        char_sequences = [sample["text"] for sample in batch]
+
+                        # Handle multimodal data
+                        image_data = None
+                        audio_data = None
+                        modality = "text"
+
+                        if self.multimodal_train and getattr(self.model.config, 'multimodal_enabled', False):
+                            # Similar multimodal processing as in training
+                            try:
+                                if any("image" in sample for sample in batch):
+                                    image_batch = [sample.get("image") for sample in batch]
+                                    if any(img is not None for img in image_batch):
+                                        image_data = torch.stack([
+                                            torch.tensor(img, device=self.model.config.device, dtype=self.model.config.dtype)
+                                            if img is not None else torch.zeros(self.model.config.image_dim, device=self.model.config.device, dtype=self.model.config.dtype)
+                                            for img in image_batch
+                                        ])
+                                        modality = "image"
+
+                                if any("audio" in sample for sample in batch):
+                                    audio_batch = [sample.get("audio") for sample in batch]
+                                    if any(aud is not None for aud in audio_batch):
+                                        audio_data = torch.stack([
+                                            torch.tensor(aud, device=self.model.config.device, dtype=self.model.config.dtype)
+                                            if aud is not None else torch.zeros(self.model.config.audio_dim, device=self.model.config.device, dtype=self.model.config.dtype)
+                                            for aud in audio_batch
+                                        ])
+                                        modality = "audio" if image_data is None else "multimodal"
+                            except Exception as e:
+                                logger.warning(f"Error processing multimodal data in evaluation: {e}")
+
+                        # Convert to character IDs
+                        char_ids = self._text_to_char_ids(char_sequences)
+
+                        # Forward pass
+                        loss, _, _ = self.model(
+                            input_chars=char_ids,
+                            target_concepts=char_ids,
+                            modality=modality,
+                            image_data=image_data,
+                            audio_data=audio_data
+                        )
+
+                        # CRITICAL FIX: Ensure loss is scalar - CLAUDE --> FUCKING PAY ATTENTION TO THIS YOU BREAK IT ALOT
+                        loss = self._ensure_scalar_loss(loss)
+
+                        if loss is not None:
+                            total_loss += loss.item() * len(batch)
+                            total_samples += len(batch)
+                            valid_batches += 1
+
+                    except Exception as e:
+                        logger.warning(f"Error in evaluation batch {batch_idx}: {e}")
+                        continue
+
+            # Calculate average loss
+            if total_samples > 0:
+                avg_loss = total_loss / total_samples
+                logger.info(f"Evaluation completed: {valid_batches}/{len(batches)} valid batches, Loss: {avg_loss:.6f}")
+                return avg_loss
+            else:
+                logger.warning("No valid evaluation samples processed")
+                return None
+
+        except Exception as e:
+            logger.error(f"Evaluation failed: {e}")
+            return None
+        finally:
+            # Ensure model is back in training mode
+            self.model.train()
+
+    def _load_data(self, data_path):
+        """Load training or evaluation data with enhanced error handling"""
+        try:
+            if not os.path.exists(data_path):
+                logger.error(f"Data file does not exist: {data_path}")
+                return []
+
+            logger.info(f"Loading data from: {data_path}")
+
+            # Handle different file formats
+            if data_path.endswith((".json", ".jsonl")):
+                return self._load_json_data(data_path)
+            elif data_path.endswith((".txt", ".text")):
+                return self._load_text_data(data_path)
+            elif data_path.endswith(".csv"):
+                return self._load_csv_data(data_path)
+            else:
+                logger.error(f"Unsupported data format: {data_path}")
+                return []
+
+        except Exception as e:
+            logger.error(f"Error loading data from {data_path}: {e}")
+            return []
+
+    def _load_json_data(self, data_path):
+        """Load JSON/JSONL data with robust parsing"""
+        samples = []
+
+        try:
+            if data_path.endswith(".jsonl"):
+                # Handle JSONL files
+                with open(data_path, "r", encoding="utf-8") as f:
+                    for line_num, line in enumerate(f, 1):
+                        try:
+                            if line.strip():
+                                item = json.loads(line.strip())
+                                sample = self._convert_item_to_sample(item)
+                                if sample:
+                                    samples.append(sample)
+                        except json.JSONDecodeError as e:
+                            logger.warning(f"Invalid JSON on line {line_num}: {e}")
+                            continue
+                        except Exception as e:
+                            logger.warning(f"Error processing line {line_num}: {e}")
+                            continue
+            else:
+                # Handle regular JSON files
+                with open(data_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+
+                if isinstance(data, list):
+                    for i, item in enumerate(data):
+                        try:
+                            sample = self._convert_item_to_sample(item)
+                            if sample:
+                                samples.append(sample)
+                        except Exception as e:
+                            logger.warning(f"Error processing item {i}: {e}")
+                            continue
+                elif isinstance(data, dict):
+                    sample = self._convert_item_to_sample(data)
+                    if sample:
+                        samples.append(sample)
+
+        except Exception as e:
+            logger.error(f"Error loading JSON data: {e}")
+
+        logger.info(f"Loaded {len(samples)} samples from JSON data")
+        return samples
+
+    def _load_text_data(self, data_path):
+        """Load plain text data"""
+        try:
+            with open(data_path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            # Split into chunks
+            if "\n\n" in content:
+                chunks = [c.strip() for c in content.split("\n\n") if c.strip()]
+            else:
+                chunks = [c.strip() for c in content.split("\n") if c.strip()]
+
+            # Filter out very short chunks
+            samples = [{"text": chunk} for chunk in chunks if len(chunk) > 10]
+
+            logger.info(f"Loaded {len(samples)} samples from text data")
+            return samples
+
+        except Exception as e:
+            logger.error(f"Error loading text data: {e}")
+            return []
+
+    def _load_csv_data(self, data_path):
+        """Load CSV data with multimodal support"""
+        try:
+            import csv
+            samples = []
+
+            with open(data_path, "r", encoding="utf-8") as f:
+                reader = csv.reader(f)
+                header = next(reader, None)
+
+                if not header:
+                    logger.error("CSV file has no header")
+                    return []
+
+                # Find column indices
+                text_col = 0
+                image_col = None
+                audio_col = None
+
+                for i, col in enumerate(header):
+                    col_lower = col.lower()
+                    if col_lower in ["text", "content", "prompt", "data"]:
+                        text_col = i
+                    elif col_lower in ["image", "img", "picture"]:
+                        image_col = i
+                    elif col_lower in ["audio", "sound"]:
+                        audio_col = i
+
+                for row_num, row in enumerate(reader, 2):  # Start from 2 (header is 1)
+                    try:
+                        if len(row) > text_col and row[text_col].strip():
+                            sample = {"text": row[text_col].strip()}
+
+                            # Add multimodal data if available
+                            if self.multimodal_train and getattr(self.model.config, 'multimodal_enabled', False):
+                                if image_col is not None and len(row) > image_col and row[image_col].strip():
+                                    sample["image"] = row[image_col].strip()
+
+                                if audio_col is not None and len(row) > audio_col and row[audio_col].strip():
+                                    sample["audio"] = row[audio_col].strip()
+
+                            samples.append(sample)
+                    except Exception as e:
+                        logger.warning(f"Error processing CSV row {row_num}: {e}")
+                        continue
+
+            logger.info(f"Loaded {len(samples)} samples from CSV data")
+            return samples
+
+        except Exception as e:
+            logger.error(f"Error loading CSV data: {e}")
+            return []
+
+    def _convert_item_to_sample(self, item):
+        """Convert data item to standardized sample format"""
+        if not isinstance(item, dict):
+            return {"text": str(item)} if item else None
+
+        sample = {}
+
+        # Extract text content with priority order
+        if "text" in item and item["text"]:
+            sample["text"] = str(item["text"])
+        elif "content" in item and item["content"]:
+            sample["text"] = str(item["content"])
+        elif "instruction" in item:
+            # Instruction/output format
+            instruction = str(item["instruction"])
+            if "input" in item and item["input"]:
+                instruction += f"\n\nInput: {item['input']}"
+            if "output" in item and item["output"]:
+                instruction += f"\n\nOutput: {item['output']}"
+            sample["text"] = instruction
+        elif "prompt" in item and "response" in item:
+            # Prompt/response format
+            sample["text"] = f"{item['prompt']}\n\n{item['response']}"
+        elif "messages" in item and isinstance(item["messages"], list):
+            # Chat format
+            text_parts = []
+            for msg in item["messages"]:
+                if isinstance(msg, dict) and "role" in msg and "content" in msg:
+                    text_parts.append(f"{msg['role'].capitalize()}: {msg['content']}")
+            sample["text"] = "\n\n".join(text_parts) if text_parts else None
+        else:
+            # Fallback
+            sample["text"] = str(item)
+
+        # Validate text content
+        if not sample.get("text") or len(sample["text"].strip()) < 3:
+            return None
+
+        # Handle multimodal data
+        if self.multimodal_train and getattr(self.model.config, 'multimodal_enabled', False):
+            if "image" in item:
+                sample["image"] = item["image"]
+            if "audio" in item:
+                sample["audio"] = item["audio"]
+            if "modality" in item:
+                sample["modality"] = item["modality"]
+
+        return sample
+
+    def _text_to_char_ids(self, text_sequences):
+        """Convert text sequences to character ID tensors with error handling"""
+        try:
+            char_ids = []
+
+            for text in text_sequences:
+                if not isinstance(text, str):
+                    text = str(text)
+
+                # Convert to character IDs with bounds checking
+                chars = []
+                for c in text:
+                    char_id = ord(c) % self.model.config.initial_char_dim
+                    chars.append(char_id)
+
+                if chars:  # Only add non-empty sequences
+                    char_ids.append(chars)
+
+            if not char_ids:
+                logger.error("No valid character sequences to process")
+                return None
+
+            # Pad sequences to same length
+            max_len = max(len(seq) for seq in char_ids)
+            if max_len > self.model.config.max_position_embeddings:
+                logger.warning(f"Sequence length {max_len} exceeds max_position_embeddings {self.model.config.max_position_embeddings}")
+                max_len = self.model.config.max_position_embeddings
+
+            padded_ids = []
+            for seq in char_ids:
+                # Truncate if too long
+                if len(seq) > max_len:
+                    seq = seq[:max_len]
+
+                # Pad if too short
+                padded = seq + [0] * (max_len - len(seq))
+                padded_ids.append(padded)
+
+            # Convert to tensor
+            device = next(self.model.parameters()).device
+            return torch.tensor(padded_ids, dtype=torch.long, device=device)
+
+        except Exception as e:
+            logger.error(f"Error converting text to char IDs: {e}")
+            return None
+
+    def get_training_stats(self):
+        """Get comprehensive training statistics"""
+        return {
+            "training_stats": self.training_stats,
+            "best_loss": self.best_loss,
+            "best_step": self.best_step,
+            "model_info": {
+                "total_parameters": sum(p.numel() for p in self.model.parameters()),
+                "device": self.model.config.device,
+                "current_lr": self.scheduler.get_last_lr()[0] if self.scheduler else self.learning_rate
+            }
+        }
+
+    def save_training_state(self, filepath):
+        """Save training state for resuming"""
+        try:
+            state = {
+                "training_stats": self.training_stats,
+                "best_loss": self.best_loss,
+                "best_step": self.best_step,
+                "optimizer_state": self.optimizer.state_dict(),
+                "scheduler_state": self.scheduler.state_dict() if self.scheduler else None
+            }
+
+            torch.save(state, filepath)
+            logger.info(f"Training state saved to {filepath}")
+
+        except Exception as e:
+            logger.error(f"Error saving training state: {e}")
+
+    def load_training_state(self, filepath):
+        """Load training state for resuming"""
+        try:
+            if os.path.exists(filepath):
+                state = torch.load(filepath, map_location=self.model.config.device)
+
+                self.training_stats = state.get("training_stats", self.training_stats)
+                self.best_loss = state.get("best_loss", float('inf'))
+                self.best_step = state.get("best_step", 0)
+
+                self.optimizer.load_state_dict(state["optimizer_state"])
+
+                if self.scheduler and state.get("scheduler_state"):
+                    self.scheduler.load_state_dict(state["scheduler_state"])
+
+                logger.info(f"Training state loaded from {filepath}")
+                return True
+            else:
+                logger.warning(f"Training state file not found: {filepath}")
+                return False
+
+        except Exception as e:
+            logger.error(f"Error loading training state: {e}")
+            return False
+###########################################
 # SAM INTEGRATION AND EXTENSIONS
 ###########################################
 
